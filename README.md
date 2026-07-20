@@ -85,14 +85,12 @@ docker compose up -d
 docker logs -f rust-app
 ```
 
-## Test if Node and Clickhouse is running acurately
+## Test if Node and Neo4j is running acurately for two Wallets
 
-### RPC BSC
-```command
-curl http://localhost:8545
-```
+source = TB16q6kpSEW2WqvTJ9ua7HAoP9ugQ2HdHZ
+target = TMeWat4Y7Sx8bfskXt1R5nDV3ZuiTDxr2N
 
-### ClickHouse
 ```command
-curl http://localhost:8123
+cargo run --bin tron_graph_api
+http://127.0.0.1:4001/
 ```
