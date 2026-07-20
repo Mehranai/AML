@@ -78,7 +78,7 @@ pub async fn run_eth_loop(config: AppConfig) -> Result<()> {
         .with_password(&config.clickhouse_pass);
 
     // init دیتابیس و جدول‌ها
-    init_eth_db(&admin_client).await?;
+    init_eth_db(&admin_client, config.eth_allow_destructive_schema_cleanup).await?;
 
     // گرفتن آخرین بلاک sync شده از دیتابیس
     let last_synced = get_last_synced_block(&loader.clickhouse, "eth").await?;

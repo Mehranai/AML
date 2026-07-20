@@ -4,9 +4,12 @@ use anyhow::Result;
 use ethers::prelude::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use crate::models::address_relationship::AddressRelationshipRow;
 use crate::models::token_transfer::TokenTransferRow;
 use crate::models::transaction::Sensivity;
-use crate::progress::core::{save_sync_state, save_token_transfer, save_tx, save_wallet};
+use crate::progress::core::{
+    save_address_relationship, save_sync_state, save_token_transfer, save_tx, save_wallet,
+};
 use crate::services::loader::LoaderEth;
 use crate::services::token_metadata_worker;
 
@@ -26,6 +29,101 @@ fn calc_sensivity_eth(value_wei: U256) -> Sensivity {
 }
 
 // استخراج Transfer Logs
+fn normalize_eth_address(address: Address) -> String {
+    format!("{address:?}").to_ascii_lowercase()
+}
+
+fn relationship_id(
+    tx_hash: &str,
+    transfer_type: &str,
+    index: u32,
+    from: &str,
+    to: &str,
+    token: &str,
+) -> String {
+    format!("{tx_hash}:{transfer_type}:{index}:{from}:{to}:{token}")
+}
+
+fn native_transfer_relationship(
+    tx_hash: &str,
+    block_number: u64,
+    from: Address,
+    to: Address,
+    value: U256,
+) -> Option<AddressRelationshipRow> {
+    if value.is_zero() || from == Address::zero() || to == Address::zero() {
+        return None;
+    }
+
+    let from_address = normalize_eth_address(from);
+    let to_address = normalize_eth_address(to);
+    let token_address = "ETH".to_string();
+
+    Some(AddressRelationshipRow {
+        relationship_id: relationship_id(
+            tx_hash,
+            "native",
+            0,
+            &from_address,
+            &to_address,
+            &token_address,
+        ),
+        from_address,
+        to_address,
+        token_address,
+        tx_hash: tx_hash.to_string(),
+        block_number,
+        timestamp: 0,
+        amount: value.to_string(),
+        transfer_type: "native_transfer".to_string(),
+        protocol: "ethereum".to_string(),
+        event_type: "transfer".to_string(),
+        risk_score: 0,
+        hop_count: 1,
+    })
+}
+
+fn erc20_transfer_relationship(
+    tx_hash: &str,
+    block_number: u64,
+    log_index: u32,
+    token: Address,
+    from: Address,
+    to: Address,
+    amount: U256,
+) -> Option<AddressRelationshipRow> {
+    if amount.is_zero() || from == Address::zero() || to == Address::zero() {
+        return None;
+    }
+
+    let from_address = normalize_eth_address(from);
+    let to_address = normalize_eth_address(to);
+    let token_address = normalize_eth_address(token);
+
+    Some(AddressRelationshipRow {
+        relationship_id: relationship_id(
+            tx_hash,
+            "erc20",
+            log_index,
+            &from_address,
+            &to_address,
+            &token_address,
+        ),
+        from_address,
+        to_address,
+        token_address,
+        tx_hash: tx_hash.to_string(),
+        block_number,
+        timestamp: 0,
+        amount: amount.to_string(),
+        transfer_type: "erc20_transfer".to_string(),
+        protocol: "erc20".to_string(),
+        event_type: "transfer".to_string(),
+        risk_score: 0,
+        hop_count: 1,
+    })
+}
+
 fn extract_token_transfers(
     receipt: &TransactionReceipt,
 ) -> Vec<(u32, Address, Address, Address, U256)> {
@@ -104,17 +202,26 @@ async fn process_tx(
     let from = tx.from;
     let to = tx.to.unwrap_or_default();
     let value = tx.value;
+    let from_address = normalize_eth_address(from);
+    let to_address = tx.to.map(normalize_eth_address).unwrap_or_default();
 
     save_tx(
         clickhouse.clone(),
         hash.clone(),
         block_number,
-        from.to_string(),
-        to.to_string(),
+        from_address,
+        to_address,
         value.to_string(),
         calc_sensivity_eth(value) as u8,
     )
     .await?;
+
+    if let Some(to_address) = tx.to
+        && let Some(row) =
+            native_transfer_relationship(&hash, block_number, from, to_address, value)
+    {
+        save_address_relationship(clickhouse.clone(), row).await?;
+    }
 
     // Receipt (Rate limited)
     let receipt_opt = {
@@ -130,19 +237,35 @@ async fn process_tx(
         for (log_index, token, from_addr, to_addr, amount) in transfers {
             discovered_tokens.push(token);
 
+            let token_address = normalize_eth_address(token);
+            let from_address = normalize_eth_address(from_addr);
+            let to_address = normalize_eth_address(to_addr);
+
             save_token_transfer(
                 clickhouse.clone(),
                 TokenTransferRow {
                     tx_hash: hash.clone(),
                     block_number,
                     log_index,
-                    token_address: token.to_string(),
-                    from_addr: from_addr.to_string(),
-                    to_addr: to_addr.to_string(),
+                    token_address,
+                    from_addr: from_address,
+                    to_addr: to_address,
                     amount: amount.to_string(),
                 },
             )
             .await?;
+
+            if let Some(row) = erc20_transfer_relationship(
+                &hash,
+                block_number,
+                log_index,
+                token,
+                from_addr,
+                to_addr,
+                amount,
+            ) {
+                save_address_relationship(clickhouse.clone(), row).await?;
+            }
         }
     }
 

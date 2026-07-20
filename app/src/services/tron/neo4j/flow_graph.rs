@@ -7,7 +7,10 @@ use serde::Deserialize;
 use super::client::Neo4jClient;
 use super::edges::{merge_exchange_interaction, merge_transfer_edge};
 use super::nodes::upsert_wallet_with_metadata;
-use super::types::{ExchangeFlowSummary, FlowEdge, FlowNode, Neo4jVisualization, WalletFlowGraph};
+use super::types::{
+    ExchangeFlowSummary, FlowEdge, FlowNode, Neo4jVisualization, WalletFlowGraph, WalletPath,
+    WalletPathGraph,
+};
 
 #[derive(Debug, Clone)]
 struct ExchangeMetadata {
@@ -21,6 +24,56 @@ struct EntityMetadata {
     entity_name: String,
     entity_type: String,
     confidence: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathSearchDirection {
+    Outgoing,
+    Incoming,
+    Any,
+}
+
+impl PathSearchDirection {
+    fn from_param(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or("outgoing")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "incoming" | "reverse" => Self::Incoming,
+            "any" | "both" | "undirected" => Self::Any,
+            _ => Self::Outgoing,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Outgoing => "outgoing",
+            Self::Incoming => "incoming",
+            Self::Any => "any",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PathSearchState {
+    current: String,
+    node_ids: Vec<String>,
+    edges: Vec<FlowEdge>,
+}
+
+#[derive(Debug, Clone)]
+struct FoundPath {
+    node_ids: Vec<String>,
+    edges: Vec<FlowEdge>,
+}
+
+#[derive(Debug, Clone)]
+struct PathSearchResult {
+    paths: Vec<FoundPath>,
+    searched_node_count: usize,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
@@ -178,6 +231,270 @@ pub async fn build_wallet_flow_graph(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn build_wallet_path_graph(
+    clickhouse: Arc<Client>,
+    neo4j: &Neo4jClient,
+    source_address: &str,
+    target_address: &str,
+    max_depth: Option<u8>,
+    max_paths: Option<usize>,
+    per_address_limit: Option<u64>,
+    direction: Option<&str>,
+) -> anyhow::Result<WalletPathGraph> {
+    neo4j.ensure_schema().await?;
+
+    let max_depth = max_depth.unwrap_or(10).clamp(1, 10);
+    let max_paths = max_paths.unwrap_or(20).clamp(1, 50);
+    let per_address_limit = per_address_limit.unwrap_or(500).clamp(1, 2_000);
+    let direction = PathSearchDirection::from_param(direction);
+
+    let search_result = find_wallet_paths(
+        clickhouse.clone(),
+        source_address,
+        target_address,
+        max_depth,
+        max_paths,
+        per_address_limit,
+        direction,
+    )
+    .await?;
+
+    let mut edge_by_id = HashMap::<String, FlowEdge>::new();
+    let mut node_ids =
+        HashSet::<String>::from([source_address.to_string(), target_address.to_string()]);
+    let mut paths = Vec::<WalletPath>::new();
+
+    for (index, path) in search_result.paths.iter().enumerate() {
+        for node_id in &path.node_ids {
+            node_ids.insert(node_id.clone());
+        }
+
+        for edge in &path.edges {
+            node_ids.insert(edge.from.clone());
+            node_ids.insert(edge.to.clone());
+            edge_by_id
+                .entry(edge.id.clone())
+                .or_insert_with(|| edge.clone());
+        }
+
+        paths.push(WalletPath {
+            path_index: index + 1,
+            hop_count: path.edges.len(),
+            node_ids: path.node_ids.clone(),
+            edge_ids: path.edges.iter().map(|edge| edge.id.clone()).collect(),
+        });
+    }
+
+    let edges = edge_by_id.into_values().collect::<Vec<_>>();
+    let mut exchange_metadata = HashMap::<String, ExchangeMetadata>::new();
+    let mut entity_metadata = HashMap::<String, EntityMetadata>::new();
+
+    for node_id in &node_ids {
+        if let Some(exchange) = load_exchange_metadata(&clickhouse, node_id).await? {
+            exchange_metadata.insert(node_id.clone(), exchange);
+        } else if let Some(entity) = load_entity_metadata(&clickhouse, node_id).await? {
+            entity_metadata.insert(node_id.clone(), entity);
+        }
+    }
+
+    let mut nodes = Vec::<FlowNode>::new();
+    for node_id in node_ids {
+        let node = build_flow_node(
+            &node_id,
+            exchange_metadata.get(&node_id),
+            entity_metadata.get(&node_id),
+            &edges,
+        );
+
+        upsert_wallet_with_metadata(
+            neo4j,
+            &node.id,
+            &node.label,
+            &node.node_type,
+            node.entity_name.as_deref(),
+            node.entity_type.as_deref(),
+            node.exchange_name.as_deref(),
+            node.exchange_role.as_deref(),
+            node.confidence,
+        )
+        .await?;
+
+        nodes.push(node);
+    }
+
+    for edge in &edges {
+        merge_transfer_edge(
+            neo4j,
+            &edge.id,
+            &edge.from,
+            &edge.to,
+            &edge.tx_hash,
+            &edge.token_address,
+            &edge.amount,
+            edge.block_number,
+            edge.timestamp,
+            edge.risk_score,
+            &edge.transfer_type,
+            &edge.operation_type,
+            &edge.relationship_type,
+            &edge.protocol,
+            edge.exchange_flow_type.as_deref(),
+            edge.exchange_name.as_deref(),
+            edge.exchange_confidence,
+        )
+        .await?;
+    }
+
+    let neo4j_visualization = Neo4jVisualization {
+        browser_url: "http://localhost:7474/browser/".to_string(),
+        cypher: neo4j_path_cypher(
+            source_address,
+            target_address,
+            max_depth,
+            max_paths,
+            direction,
+        ),
+        imported_wallet_nodes: nodes.len(),
+        imported_transfer_edges: edges.len(),
+        imported_exchange_interactions: 0,
+    };
+
+    Ok(WalletPathGraph {
+        address: source_address.to_string(),
+        source_address: source_address.to_string(),
+        target_address: target_address.to_string(),
+        max_depth,
+        direction: direction.as_str().to_string(),
+        path_count: paths.len(),
+        searched_node_count: search_result.searched_node_count,
+        truncated: search_result.truncated,
+        nodes,
+        edges,
+        paths,
+        exchange_interactions: Vec::new(),
+        neo4j: neo4j_visualization,
+    })
+}
+
+async fn find_wallet_paths(
+    clickhouse: Arc<Client>,
+    source_address: &str,
+    target_address: &str,
+    max_depth: u8,
+    max_paths: usize,
+    per_address_limit: u64,
+    direction: PathSearchDirection,
+) -> anyhow::Result<PathSearchResult> {
+    let mut queue = VecDeque::<PathSearchState>::from([PathSearchState {
+        current: source_address.to_string(),
+        node_ids: vec![source_address.to_string()],
+        edges: Vec::new(),
+    }]);
+    let mut found_paths = Vec::<FoundPath>::new();
+    let mut searched_node_count = 0usize;
+    let mut truncated = false;
+    let max_expanded_nodes = 25_000usize;
+
+    while let Some(state) = queue.pop_front() {
+        if state.edges.len() >= usize::from(max_depth) {
+            continue;
+        }
+
+        if searched_node_count >= max_expanded_nodes {
+            truncated = true;
+            break;
+        }
+
+        searched_node_count += 1;
+        let rows = load_path_relationships_for_address(
+            &clickhouse,
+            &state.current,
+            direction,
+            per_address_limit,
+        )
+        .await?;
+
+        for row in rows {
+            let edge = relationship_row_to_edge(row);
+
+            let Some(next_address) = next_path_address(&edge, &state.current, direction) else {
+                continue;
+            };
+
+            if state.node_ids.iter().any(|node| node == &next_address) {
+                continue;
+            }
+
+            let mut next_node_ids = state.node_ids.clone();
+            next_node_ids.push(next_address.clone());
+
+            let mut next_edges = state.edges.clone();
+            next_edges.push(edge);
+
+            if next_address == target_address {
+                found_paths.push(FoundPath {
+                    node_ids: next_node_ids,
+                    edges: next_edges,
+                });
+
+                if found_paths.len() >= max_paths {
+                    truncated = true;
+                    break;
+                }
+            } else {
+                queue.push_back(PathSearchState {
+                    current: next_address,
+                    node_ids: next_node_ids,
+                    edges: next_edges,
+                });
+            }
+        }
+
+        if found_paths.len() >= max_paths {
+            break;
+        }
+    }
+
+    Ok(PathSearchResult {
+        paths: found_paths,
+        searched_node_count,
+        truncated,
+    })
+}
+
+fn next_path_address(
+    edge: &FlowEdge,
+    current: &str,
+    direction: PathSearchDirection,
+) -> Option<String> {
+    match direction {
+        PathSearchDirection::Outgoing => {
+            if edge.from == current {
+                Some(edge.to.clone())
+            } else {
+                None
+            }
+        }
+        PathSearchDirection::Incoming => {
+            if edge.to == current {
+                Some(edge.from.clone())
+            } else {
+                None
+            }
+        }
+        PathSearchDirection::Any => {
+            if edge.from == current {
+                Some(edge.to.clone())
+            } else if edge.to == current {
+                Some(edge.from.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 async fn load_relationship_neighborhood(
     clickhouse: Arc<Client>,
     address: &str,
@@ -276,6 +593,166 @@ async fn load_relationships_for_address(
         .bind(limit)
         .fetch_all::<RelationshipReadRow>()
         .await?;
+
+    Ok(rows)
+}
+
+async fn load_path_relationships_for_address(
+    clickhouse: &Client,
+    address: &str,
+    direction: PathSearchDirection,
+    limit: u64,
+) -> anyhow::Result<Vec<RelationshipReadRow>> {
+    let query = match direction {
+        PathSearchDirection::Outgoing => {
+            r#"
+            SELECT
+                ar.relationship_id,
+                ar.from_address,
+                ar.to_address,
+                ar.token_address,
+                ar.tx_hash,
+                ar.block_number,
+                toUInt64(ar.timestamp) AS timestamp_unix,
+                toString(ar.amount) AS amount_string,
+                ar.transfer_type,
+                ar.protocol,
+                ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
+                ifNull(ef.exchange_name, '') AS exchange_name,
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
+                ar.risk_score
+            FROM address_relationships AS ar
+            LEFT JOIN
+            (
+                SELECT
+                    tx_hash,
+                    from_address,
+                    to_address,
+                    token_address,
+                    amount,
+                    any(exchange_name) AS exchange_name,
+                    any(flow_type) AS exchange_flow_type,
+                    max(confidence) AS exchange_confidence
+                FROM exchange_flows
+                GROUP BY
+                    tx_hash,
+                    from_address,
+                    to_address,
+                    token_address,
+                    amount
+            ) AS ef
+                ON ar.tx_hash = ef.tx_hash
+                AND ar.from_address = ef.from_address
+                AND ar.to_address = ef.to_address
+                AND ar.token_address = ef.token_address
+                AND ar.amount = ef.amount
+            WHERE ar.from_address = ?
+            ORDER BY ar.block_number DESC
+            LIMIT ?
+            "#
+        }
+        PathSearchDirection::Incoming => {
+            r#"
+            SELECT
+                ar.relationship_id,
+                ar.from_address,
+                ar.to_address,
+                ar.token_address,
+                ar.tx_hash,
+                ar.block_number,
+                toUInt64(ar.timestamp) AS timestamp_unix,
+                toString(ar.amount) AS amount_string,
+                ar.transfer_type,
+                ar.protocol,
+                ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
+                ifNull(ef.exchange_name, '') AS exchange_name,
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
+                ar.risk_score
+            FROM address_relationships AS ar
+            LEFT JOIN
+            (
+                SELECT
+                    tx_hash,
+                    from_address,
+                    to_address,
+                    token_address,
+                    amount,
+                    any(exchange_name) AS exchange_name,
+                    any(flow_type) AS exchange_flow_type,
+                    max(confidence) AS exchange_confidence
+                FROM exchange_flows
+                GROUP BY
+                    tx_hash,
+                    from_address,
+                    to_address,
+                    token_address,
+                    amount
+            ) AS ef
+                ON ar.tx_hash = ef.tx_hash
+                AND ar.from_address = ef.from_address
+                AND ar.to_address = ef.to_address
+                AND ar.token_address = ef.token_address
+                AND ar.amount = ef.amount
+            WHERE ar.to_address = ?
+            ORDER BY ar.block_number DESC
+            LIMIT ?
+            "#
+        }
+        PathSearchDirection::Any => {
+            r#"
+            SELECT
+                ar.relationship_id,
+                ar.from_address,
+                ar.to_address,
+                ar.token_address,
+                ar.tx_hash,
+                ar.block_number,
+                toUInt64(ar.timestamp) AS timestamp_unix,
+                toString(ar.amount) AS amount_string,
+                ar.transfer_type,
+                ar.protocol,
+                ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
+                ifNull(ef.exchange_name, '') AS exchange_name,
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
+                ar.risk_score
+            FROM address_relationships AS ar
+            LEFT JOIN
+            (
+                SELECT
+                    tx_hash,
+                    from_address,
+                    to_address,
+                    token_address,
+                    amount,
+                    any(exchange_name) AS exchange_name,
+                    any(flow_type) AS exchange_flow_type,
+                    max(confidence) AS exchange_confidence
+                FROM exchange_flows
+                GROUP BY
+                    tx_hash,
+                    from_address,
+                    to_address,
+                    token_address,
+                    amount
+            ) AS ef
+                ON ar.tx_hash = ef.tx_hash
+                AND ar.from_address = ef.from_address
+                AND ar.to_address = ef.to_address
+                AND ar.token_address = ef.token_address
+                AND ar.amount = ef.amount
+            WHERE ar.from_address = ? OR ar.to_address = ?
+            ORDER BY ar.block_number DESC
+            LIMIT ?
+            "#
+        }
+    };
+
+    let mut query = clickhouse.query(query).bind(address);
+    if matches!(direction, PathSearchDirection::Any) {
+        query = query.bind(address);
+    }
+
+    let rows = query.bind(limit).fetch_all::<RelationshipReadRow>().await?;
 
     Ok(rows)
 }
@@ -587,6 +1064,34 @@ pub fn neo4j_browser_cypher(address: &str, depth: u8, limit: u64) -> String {
         "MATCH p = (w:Wallet {{ address: '{}' }})-[*1..{}]-(n) RETURN p LIMIT {}",
         escaped_address, safe_depth, safe_limit
     )
+}
+
+fn neo4j_path_cypher(
+    source_address: &str,
+    target_address: &str,
+    max_depth: u8,
+    limit: usize,
+    direction: PathSearchDirection,
+) -> String {
+    let safe_depth = max_depth.clamp(1, 10);
+    let safe_limit = limit.clamp(1, 50);
+    let source = source_address.replace('\\', "\\\\").replace('\'', "\\'");
+    let target = target_address.replace('\\', "\\\\").replace('\'', "\\'");
+
+    match direction {
+        PathSearchDirection::Incoming => format!(
+            "MATCH p = (source:Wallet {{ address: '{}' }})<-[*1..{}]-(target:Wallet {{ address: '{}' }}) RETURN p LIMIT {}",
+            source, safe_depth, target, safe_limit
+        ),
+        PathSearchDirection::Any => format!(
+            "MATCH p = (source:Wallet {{ address: '{}' }})-[*1..{}]-(target:Wallet {{ address: '{}' }}) RETURN p LIMIT {}",
+            source, safe_depth, target, safe_limit
+        ),
+        PathSearchDirection::Outgoing => format!(
+            "MATCH p = (source:Wallet {{ address: '{}' }})-[*1..{}]->(target:Wallet {{ address: '{}' }}) RETURN p LIMIT {}",
+            source, safe_depth, target, safe_limit
+        ),
+    }
 }
 
 #[cfg(test)]

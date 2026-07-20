@@ -1,4 +1,5 @@
 // src/models/mod.rs
+pub mod address_relationship;
 pub mod blockstreams;
 pub mod owner;
 pub mod sync_state;
@@ -9,6 +10,7 @@ pub mod tron;
 pub mod wallet;
 
 // Structs for ClickHouse
+pub use address_relationship::AddressRelationshipRow;
 pub use owner::OwnerRow;
 pub use sync_state::SyncStateRow;
 pub use token_metadata::TokenMetadataRow;

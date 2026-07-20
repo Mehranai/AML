@@ -58,6 +58,31 @@ pub struct WalletFlowGraph {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WalletPathGraph {
+    pub address: String,
+    pub source_address: String,
+    pub target_address: String,
+    pub max_depth: u8,
+    pub direction: String,
+    pub path_count: usize,
+    pub searched_node_count: usize,
+    pub truncated: bool,
+    pub nodes: Vec<FlowNode>,
+    pub edges: Vec<FlowEdge>,
+    pub paths: Vec<WalletPath>,
+    pub exchange_interactions: Vec<ExchangeFlowSummary>,
+    pub neo4j: Neo4jVisualization,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WalletPath {
+    pub path_index: usize,
+    pub hop_count: usize,
+    pub node_ids: Vec<String>,
+    pub edge_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Neo4jVisualization {
     pub browser_url: String,
     pub cypher: String,

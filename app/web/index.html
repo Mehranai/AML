@@ -181,6 +181,32 @@
       background: #ffffff;
     }
 
+    .path-form {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .path-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    .path-actions {
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .path-summary {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      margin: 0 0 10px;
+    }
+
     .status {
       display: flex;
       align-items: center;
@@ -914,6 +940,29 @@
               <a class="badge" id="neo4jLink" href="#" target="_blank" rel="noreferrer">Browser</a>
             </div>
             <div class="panel-body">
+              <form class="path-form" id="pathForm">
+                <div class="path-grid">
+                  <input class="input" id="pathSourceInput" autocomplete="off" placeholder="Source wallet" spellcheck="false">
+                  <input class="input" id="pathTargetInput" autocomplete="off" placeholder="Target wallet" spellcheck="false">
+                </div>
+                <div class="path-actions">
+                  <select class="select" id="pathDepthInput" aria-label="Path depth">
+                    <option value="1">1 hop</option>
+                    <option value="2">2 hops</option>
+                    <option value="3">3 hops</option>
+                    <option value="4">4 hops</option>
+                    <option value="5">5 hops</option>
+                    <option value="6">6 hops</option>
+                    <option value="7">7 hops</option>
+                    <option value="8">8 hops</option>
+                    <option value="9">9 hops</option>
+                    <option value="10" selected>10 hops</option>
+                  </select>
+                  <button class="secondary" id="pathButton" type="submit">Find Path</button>
+                </div>
+              </form>
+              <div class="path-summary" id="pathSummary">No wallet path search loaded.</div>
+              <div class="list" id="pathList" style="margin-bottom:12px"></div>
               <div class="kv" style="margin-bottom:12px">
                 <div class="kv-row"><span>Wallet nodes</span><strong id="neoWalletNodes">0</strong></div>
                 <div class="kv-row"><span>Transfer edges</span><strong id="neoTransferEdges">0</strong></div>
@@ -938,6 +987,7 @@
       fingerprint: null,
       aiRisk: null,
       dataQuality: null,
+      pathResult: null,
       inspectorTab: 'holdings',
       selectedNodeId: null,
       filter: {
@@ -962,6 +1012,13 @@
       riskFilter: document.getElementById('riskFilter'),
       riskValue: document.getElementById('riskValue'),
       exchangeOnly: document.getElementById('exchangeOnly'),
+      pathForm: document.getElementById('pathForm'),
+      pathSource: document.getElementById('pathSourceInput'),
+      pathTarget: document.getElementById('pathTargetInput'),
+      pathDepth: document.getElementById('pathDepthInput'),
+      pathButton: document.getElementById('pathButton'),
+      pathSummary: document.getElementById('pathSummary'),
+      pathList: document.getElementById('pathList'),
       inspectorTabs: Array.from(document.querySelectorAll('[data-inspector-tab]')),
       inspectorPanels: Array.from(document.querySelectorAll('[data-inspector-panel]')),
       toast: document.getElementById('toast')
@@ -970,6 +1027,11 @@
     els.form.addEventListener('submit', (event) => {
       event.preventDefault();
       loadInvestigation();
+    });
+
+    els.pathForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      loadWalletPath();
     });
 
     els.operationFilter.addEventListener('change', () => {
@@ -1038,8 +1100,12 @@
         state.fingerprint = state.investigation.fingerprint;
         state.aiRisk = state.investigation.ai_risk;
         state.dataQuality = state.investigation.data_quality;
+        state.pathResult = null;
         state.selectedNodeId = state.graph.address;
         els.activeAddress.textContent = state.graph.address;
+        if (!els.pathSource.value.trim()) {
+          els.pathSource.value = state.graph.address;
+        }
         hydrateOperationFilter();
         renderAll();
         showToast('Investigation loaded.');
@@ -1050,10 +1116,59 @@
       }
     }
 
+    async function loadWalletPath() {
+      const source = els.pathSource.value.trim() || els.wallet.value.trim();
+      const target = els.pathTarget.value.trim();
+      const maxDepth = Number(els.pathDepth.value || 10);
+
+      if (!source || !target) {
+        showToast('Source and target wallets are required.');
+        return;
+      }
+
+      setPathLoading(true);
+
+      try {
+        const query = new URLSearchParams({
+          max_depth: String(maxDepth),
+          limit: '20',
+          per_address_limit: '500',
+          direction: 'outgoing'
+        });
+        const response = await fetch(`/api/tron/wallet/${encodeURIComponent(source)}/paths/${encodeURIComponent(target)}?${query.toString()}`, {
+          headers: { accept: 'application/json' }
+        });
+
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || `Request failed with ${response.status}`);
+        }
+
+        state.pathResult = await response.json();
+        state.graph = state.pathResult;
+        state.selectedNodeId = state.pathResult.source_address;
+        state.inspectorTab = 'neo4j';
+        els.activeAddress.textContent = `${shortAddress(state.pathResult.source_address)} -> ${shortAddress(state.pathResult.target_address)}`;
+        hydrateOperationFilter();
+        renderAll();
+        showToast(state.pathResult.path_count ? 'Wallet path loaded.' : 'No path found.');
+      } catch (error) {
+        showToast(error.message || 'Failed to load wallet path.');
+      } finally {
+        setPathLoading(false);
+      }
+    }
+
     function setLoading(loading) {
       els.button.disabled = loading;
       els.button.textContent = loading ? 'Tracing...' : 'Trace';
       els.status.innerHTML = `<span class="pulse" style="background:${loading ? '#b76e00' : '#2f7d48'}"></span>${loading ? 'Loading' : 'Ready'}`;
+    }
+
+    function setPathLoading(loading) {
+      els.pathButton.disabled = loading;
+      els.pathButton.textContent = loading ? 'Searching...' : 'Find Path';
+      els.status.innerHTML = `<span class="pulse" style="background:${loading ? '#b76e00' : '#2f7d48'}"></span>${loading ? 'Searching path' : 'Ready'}`;
     }
 
     function hydrateOperationFilter() {
@@ -1074,6 +1189,7 @@
       renderExchangeTable();
       renderNodeDetails();
       renderNeo4j();
+      renderPathResult();
     }
 
     function setInspectorTab(tabName) {
@@ -1151,7 +1267,9 @@
       document.getElementById('metricEdges').textContent = String(edges.length);
       document.getElementById('metricExchanges').textContent = String(exchangeNames.size);
       const riskPercent = state.aiRisk?.risk_percent;
-      document.getElementById('metricRisk').textContent = riskPercent == null ? 'Pending' : `${riskPercent}%`;
+      document.getElementById('metricRisk').textContent = state.aiRisk?.status === 'DISABLED'
+        ? 'Off'
+        : riskPercent == null ? 'Pending' : `${riskPercent}%`;
       document.getElementById('metricAssets').textContent = String(state.holdings?.total_asset_count || 0);
       document.getElementById('metricNeo4j').textContent = String(graph?.neo4j?.imported_transfer_edges || 0);
     }
@@ -1504,6 +1622,39 @@
         <div class="kv-row"><span>Exchange</span><strong>${escapeHtml(exchangeLabel(node))}</strong></div>
         <div class="kv-row"><span>Confidence</span><strong>${node.confidence == null ? '-' : Math.round(Number(node.confidence) * 100) + '%'}</strong></div>
       `;
+    }
+
+    function renderPathResult() {
+      const result = state.pathResult;
+
+      if (!result) {
+        els.pathSummary.textContent = 'No wallet path search loaded.';
+        els.pathList.innerHTML = '';
+        return;
+      }
+
+      const depth = Number(result.max_depth || 10);
+      const searched = Number(result.searched_node_count || 0);
+      const truncated = result.truncated ? ' / capped' : '';
+      els.pathSummary.textContent = result.path_count
+        ? `${result.path_count} path(s), ${result.edges?.length || 0} edge(s), ${searched} node expansion(s)${truncated}.`
+        : `No directed path found up to ${depth} hop(s), ${searched} node expansion(s)${truncated}.`;
+
+      const edgesById = new Map((result.edges || []).map((edge) => [edge.id, edge]));
+      els.pathList.innerHTML = (result.paths || []).length
+        ? result.paths.slice(0, 10).map((path) => {
+            const firstEdge = edgesById.get(path.edge_ids?.[0]);
+            const lastEdge = edgesById.get(path.edge_ids?.[path.edge_ids.length - 1]);
+            const token = firstEdge?.token_address || lastEdge?.token_address || '-';
+            const tail = path.node_ids?.length ? path.node_ids.map(shortAddress).join(' -> ') : '-';
+
+            return `
+              <div class="list-item">
+                <span>${escapeHtml(tail)}<br><span class="mono">${escapeHtml(shortAddress(token))}</span></span>
+                <strong>${Number(path.hop_count || 0)} hop</strong>
+              </div>`;
+          }).join('')
+        : '<div class="list-item"><span>No path found</span><strong>-</strong></div>';
     }
 
     function renderNeo4j() {

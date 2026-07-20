@@ -5,7 +5,9 @@ use serde::Serialize;
 
 use crate::services::tron::{
     neo4j::{client::Neo4jClient, flow_graph::build_wallet_flow_graph, types::WalletFlowGraph},
-    wallet_ai_risk::{WalletAiRiskAssessment, build_and_persist_wallet_ai_risk},
+    wallet_ai_risk::{
+        WalletAiRiskAssessment, build_and_persist_wallet_ai_risk, build_disabled_wallet_ai_risk,
+    },
     wallet_exposure::load_wallet_exposure_summary,
     wallet_fingerprint::{WalletFingerprint, build_wallet_fingerprint},
     wallet_holdings::{WalletHoldings, build_wallet_holdings},
@@ -19,6 +21,7 @@ pub struct WalletInvestigationOptions {
     pub top_counterparties: Option<usize>,
     pub max_events: Option<u64>,
     pub holdings_limit: Option<u64>,
+    pub ai_risk_enabled: bool,
 }
 
 impl WalletInvestigationOptions {
@@ -29,6 +32,7 @@ impl WalletInvestigationOptions {
         top_counterparties: Option<usize>,
         max_events: Option<u64>,
         holdings_limit: Option<u64>,
+        ai_risk_enabled: bool,
     ) -> Self {
         Self {
             graph_depth: graph_depth.unwrap_or(3).clamp(1, 6),
@@ -37,6 +41,7 @@ impl WalletInvestigationOptions {
             top_counterparties,
             max_events,
             holdings_limit,
+            ai_risk_enabled,
         }
     }
 }
@@ -93,7 +98,11 @@ pub async fn build_wallet_investigation(
     .await?;
 
     let exposure = load_wallet_exposure_summary(clickhouse.clone(), address, Some(25)).await?;
-    let ai_risk = build_and_persist_wallet_ai_risk(clickhouse, &fingerprint, exposure).await?;
+    let ai_risk = if options.ai_risk_enabled {
+        build_and_persist_wallet_ai_risk(clickhouse, &fingerprint, exposure).await?
+    } else {
+        build_disabled_wallet_ai_risk(&fingerprint, exposure)
+    };
     let data_quality = build_data_quality(
         &graph,
         &holdings,

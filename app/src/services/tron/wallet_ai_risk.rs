@@ -13,6 +13,7 @@ use crate::services::tron::wallet_fingerprint::{WalletFingerprint, build_wallet_
 const FEATURE_SCHEMA_VERSION: &str = "tron_wallet_behavior_features_v2";
 const ML_STATUS_SCORED: &str = "SCORED";
 const ML_STATUS_NOT_TRAINED: &str = "MODEL_NOT_TRAINED";
+const ML_STATUS_DISABLED: &str = "DISABLED";
 
 const MODEL_FEATURE_NAMES: &[&str] = &[
     "total_transfers_log",
@@ -346,6 +347,14 @@ pub async fn build_and_persist_wallet_ai_risk(
     Ok(assessment)
 }
 
+pub fn build_disabled_wallet_ai_risk(
+    fingerprint: &WalletFingerprint,
+    exposure: WalletExposureSummary,
+) -> WalletAiRiskAssessment {
+    let snapshot = build_wallet_feature_snapshot(fingerprint, &exposure);
+    model_disabled_assessment(snapshot)
+}
+
 pub fn build_wallet_feature_snapshot(
     fingerprint: &WalletFingerprint,
     exposure: &WalletExposureSummary,
@@ -538,6 +547,37 @@ fn model_not_trained_assessment(snapshot: WalletFeatureSnapshot) -> WalletAiRisk
         risk_percent: None,
         risk_score: None,
         risk_level: "UNAVAILABLE".to_string(),
+        confidence: None,
+        model_id: None,
+        model_version: None,
+        model_family: None,
+        calibration_version: None,
+        feature_schema_version: snapshot.feature_schema_version.clone(),
+        feature_importance: Vec::new(),
+        model_patterns: Vec::new(),
+        evidence_refs,
+        feature_snapshot: snapshot,
+        inferred_at_unix_ms,
+        persistence: None,
+    }
+}
+
+fn model_disabled_assessment(snapshot: WalletFeatureSnapshot) -> WalletAiRiskAssessment {
+    let inferred_at_unix_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let evidence_refs = snapshot.evidence_refs.clone();
+
+    WalletAiRiskAssessment {
+        status: ML_STATUS_DISABLED.to_string(),
+        message:
+            "TRON wallet AI risk inference is disabled. Set TRON_AI_RISK_ENABLED=true to score wallets."
+                .to_string(),
+        prediction_id: None,
+        snapshot_id: snapshot.snapshot_id.clone(),
+        address: snapshot.address.clone(),
+        window_days: snapshot.window_days,
+        risk_percent: None,
+        risk_score: None,
+        risk_level: "DISABLED".to_string(),
         confidence: None,
         model_id: None,
         model_version: None,

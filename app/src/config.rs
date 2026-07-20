@@ -76,7 +76,9 @@ pub struct AppConfig {
     pub neo4j_username: String,
     pub neo4j_password: String,
 
+    pub eth_allow_destructive_schema_cleanup: bool,
     pub tron_allow_destructive_schema_cleanup: bool,
+    pub tron_ai_risk_enabled: bool,
 }
 
 impl AppConfig {
@@ -127,12 +129,17 @@ impl AppConfig {
 
             neo4j_uri: env_string("NEO4J_URI", "localhost:7687"),
             neo4j_username: env_string("NEO4J_USERNAME", "neo4j"),
-            neo4j_password: env_string("NEO4J_PASSWORD", ""),
+            neo4j_password: env_string("NEO4J_PASSWORD", "password"),
 
+            eth_allow_destructive_schema_cleanup: env_bool(
+                "ETH_ALLOW_DESTRUCTIVE_SCHEMA_CLEANUP",
+                false,
+            ),
             tron_allow_destructive_schema_cleanup: env_bool(
                 "TRON_ALLOW_DESTRUCTIVE_SCHEMA_CLEANUP",
                 false,
             ),
+            tron_ai_risk_enabled: env_bool("TRON_AI_RISK_ENABLED", false),
         }
     }
 }

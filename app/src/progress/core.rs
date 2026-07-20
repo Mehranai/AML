@@ -4,6 +4,7 @@ use anyhow::Result;
 use clickhouse::Client;
 use nanoid::nanoid;
 
+use crate::models::address_relationship::AddressRelationshipRow;
 use crate::models::owner::OwnerRow;
 use crate::models::token_metadata::TokenMetadataRow;
 use crate::models::token_transfer::TokenTransferRow;
@@ -193,6 +194,26 @@ pub fn generate_person_id() -> String {
 pub async fn save_token_transfer(clickhouse: Arc<Client>, row: TokenTransferRow) -> Result<()> {
     let mut insert = clickhouse
         .insert::<TokenTransferRow>("token_transfers")
+        .await?;
+
+    insert.write(&row).await?;
+    insert.end().await?;
+
+    Ok(())
+}
+
+//
+// --------------------------------------------------
+// ADDRESS RELATIONSHIPS
+// --------------------------------------------------
+//
+
+pub async fn save_address_relationship(
+    clickhouse: Arc<Client>,
+    row: AddressRelationshipRow,
+) -> Result<()> {
+    let mut insert = clickhouse
+        .insert::<AddressRelationshipRow>("address_relationships")
         .await?;
 
     insert.write(&row).await?;

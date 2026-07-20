@@ -7,8 +7,10 @@ use serde::Deserialize;
 use crate::config::AppConfig;
 use crate::handlers::tron_common::{TronApiError, clickhouse_client, normalize_wallet_address};
 use crate::services::tron::wallet_ai_risk::{
-    WalletAiRiskAssessment, build_wallet_ai_risk_assessment,
+    WalletAiRiskAssessment, build_disabled_wallet_ai_risk, build_wallet_ai_risk_assessment,
 };
+use crate::services::tron::wallet_exposure::load_wallet_exposure_summary;
+use crate::services::tron::wallet_fingerprint::build_wallet_fingerprint;
 
 #[derive(Debug, Deserialize)]
 pub struct WalletAiRiskQuery {
@@ -25,15 +27,32 @@ pub async fn tron_wallet_ai_risk(
     let address = normalize_wallet_address(&address)?;
     let clickhouse = clickhouse_client(&config);
 
-    let assessment = build_wallet_ai_risk_assessment(
-        clickhouse,
-        &address,
-        params.window_days,
-        params.top_counterparties,
-        params.max_events,
-    )
-    .await
-    .map_err(TronApiError::internal)?;
+    let assessment = if config.tron_ai_risk_enabled {
+        build_wallet_ai_risk_assessment(
+            clickhouse,
+            &address,
+            params.window_days,
+            params.top_counterparties,
+            params.max_events,
+        )
+        .await
+        .map_err(TronApiError::internal)?
+    } else {
+        let fingerprint = build_wallet_fingerprint(
+            clickhouse.clone(),
+            &address,
+            params.window_days,
+            params.top_counterparties,
+            params.max_events,
+        )
+        .await
+        .map_err(TronApiError::internal)?;
+        let exposure = load_wallet_exposure_summary(clickhouse, &address, Some(25))
+            .await
+            .map_err(TronApiError::internal)?;
+
+        build_disabled_wallet_ai_risk(&fingerprint, exposure)
+    };
 
     Ok(Json(assessment))
 }

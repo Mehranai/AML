@@ -37,6 +37,7 @@ pub async fn tron_wallet_investigation(
         params.top_counterparties,
         params.max_events,
         params.holdings_limit,
+        config.tron_ai_risk_enabled,
     );
 
     let investigation = build_wallet_investigation(clickhouse, &neo4j, &address, options)
