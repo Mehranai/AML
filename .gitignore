@@ -17,3 +17,5 @@ node/BSC/data/
 node/Ethereum/data/
 node/Tron/tron-data
 node/Tron/tron-logs
+node/Solana/data/
+node/Solana/logs/

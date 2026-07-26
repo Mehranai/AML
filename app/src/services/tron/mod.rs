@@ -1,5 +1,6 @@
 pub mod address_intelligence;
 pub mod aml;
+pub mod analytical_node;
 pub mod batcher;
 pub mod counterparty;
 pub mod exchange;

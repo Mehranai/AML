@@ -1,6 +1,7 @@
 use crate::handlers::{
     dashboard, eth_wallet_holdings, health, status, tron_graph, tron_wallet_ai_risk,
-    tron_wallet_fingerprint, tron_wallet_holdings, tron_wallet_investigation, tron_wallet_paths,
+    tron_wallet_analysis, tron_wallet_fingerprint, tron_wallet_holdings, tron_wallet_investigation,
+    tron_wallet_paths,
 };
 use axum::{
     Router,
@@ -37,6 +38,10 @@ pub fn build_router() -> Router {
             get(tron_wallet_investigation::tron_wallet_investigation),
         )
         .route(
+            "/analysis/tron/wallet/{address}",
+            get(tron_wallet_analysis::tron_wallet_analysis_snapshot),
+        )
+        .route(
             "/tron/wallet/{address}/neo4j/import",
             post(tron_graph::tron_wallet_graph),
         )
@@ -67,6 +72,10 @@ pub fn build_router() -> Router {
         .route(
             "/api/tron/wallet/{address}/investigation",
             get(tron_wallet_investigation::tron_wallet_investigation),
+        )
+        .route(
+            "/api/analysis/tron/wallet/{address}",
+            get(tron_wallet_analysis::tron_wallet_analysis_snapshot),
         )
         .route(
             "/api/tron/wallet/{address}/neo4j/import",
