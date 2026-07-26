@@ -96,3 +96,25 @@ curl http://localhost:8545
 ```command
 curl http://localhost:8123
 ```
+
+## Last Update (Solana Node + Analystical Node)
+
+### Solana Node Running code
+
+```command
+cd D:\Sarbazi\dockerizd_eth_code\node\Solana
+docker compose --profile mainnet up -d --build solana-mainnet-rpc
+```
+
+### Analystical Node Running Code
+
+```command
+cd D:\Sarbazi\dockerizd_eth_code\app
+cargo run --bin tron_init_schema
+cargo run --bin tron_graph_api
+```
+
+Then we are going to RUn this:
+```powershell
+Invoke-RestMethod "http://127.0.0.1:4001/api/analysis/tron/wallet/TB16q6kpSEW2WqvTJ9ua7HAoP9ugQ2HdHZ?refresh=true"
+```
