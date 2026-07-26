@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  solana-mainnet-rpc:
+    build:
+      context: .
+      args:
+        AGAVE_RELEASE: stable
+    image: local/agave-solana-rpc:stable
+    container_name: solana-mainnet-rpc
+    restart: unless-stopped
+    profiles:
+      - mainnet
+    environment:
+      SOLANA_CLUSTER: mainnet-beta
+      SOLANA_NO_VOTING: "true"
+      SOLANA_PRIVATE_RPC: "true"
+      SOLANA_FULL_RPC_API: "true"
+      SOLANA_ENABLE_RPC_TRANSACTION_HISTORY: "true"
+      SOLANA_ENABLE_CPI_AND_LOG_STORAGE: "true"
+      SOLANA_LIMIT_LEDGER_SIZE: "false"
+      SOLANA_RPC_BIND_ADDRESS: 0.0.0.0
+      SOLANA_RPC_PORT: "8899"
+      SOLANA_DYNAMIC_PORT_RANGE: 8000-8029
+    volumes:
+      - ./data/ledger:/solana/ledger
+      - ./data/accounts:/solana/accounts
+      - ./data/config:/solana/config
+      - ./logs:/solana/logs
+    ports:
+      - "8899:8899"
+      - "8900:8900"
+      - "8000-8029:8000-8029/tcp"
+      - "8000-8029:8000-8029/udp"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-sSf",
+          "-X",
+          "POST",
+          "-H",
+          "Content-Type: application/json",
+          "--data",
+          "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}",
+          "http://localhost:8899"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 5m
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+      memlock:
+        soft: -1
+        hard: -1
+    networks:
+      - blockchain-net
+
+networks:
+  blockchain-net:
+    external: true
