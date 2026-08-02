@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use clickhouse::Client;
+use sha2::{Digest, Sha256};
 
 use crate::models::tron::exchange::ExchangeFlowRow;
 use crate::services::tron::aml::types::SimpleTransfer;
@@ -25,7 +26,7 @@ pub async fn build_exchange_flows(
                     role: detection.address.address_role.clone(),
                     confidence: detection.address.confidence,
                     detection_source: detection.address.detection_source.clone(),
-                    cluster_id: Some(detection.cluster.cluster_id.clone()),
+                    cluster_id: Some(detection.address.entity_id.clone()),
                 },
             )
         })
@@ -44,7 +45,19 @@ pub async fn build_exchange_flows(
             continue;
         };
 
+        let flow_type = flow_type.to_string();
+        let flow_id = exchange_flow_id(
+            tx_hash,
+            &transfer.from,
+            &transfer.to,
+            &transfer.token,
+            &transfer.raw_amount.to_string(),
+            &flow_type,
+            &exchange.exchange_name,
+        );
+
         flows.push(ExchangeFlowRow {
+            flow_id,
             tx_hash: tx_hash.to_string(),
             block_number,
             from_address: transfer.from.clone(),
@@ -52,12 +65,28 @@ pub async fn build_exchange_flows(
             exchange_name: exchange.exchange_name.clone(),
             flow_type,
             token_address: transfer.token.clone(),
-            amount: transfer.amount,
+            amount: transfer.raw_amount,
             confidence,
         });
     }
 
     Ok(flows)
+}
+
+fn exchange_flow_id(
+    tx_hash: &str,
+    from_address: &str,
+    to_address: &str,
+    token_address: &str,
+    amount: &str,
+    flow_type: &str,
+    exchange_name: &str,
+) -> String {
+    let identity = format!(
+        "{tx_hash}|{from_address}|{to_address}|{token_address}|{amount}|{flow_type}|{exchange_name}"
+    );
+
+    format!("{:x}", Sha256::digest(identity.as_bytes()))
 }
 
 async fn exchange_for_address(
@@ -142,5 +171,15 @@ mod tests {
 
         assert_eq!(flow_type, "sweep");
         assert_eq!(confidence, 0.9);
+    }
+
+    #[test]
+    fn exchange_flow_identity_is_stable_and_content_addressed() {
+        let first = exchange_flow_id("tx", "from", "to", "token", "42", "deposit", "Binance");
+        let replay = exchange_flow_id("tx", "from", "to", "token", "42", "deposit", "Binance");
+        let changed = exchange_flow_id("tx", "from", "to", "token", "43", "deposit", "Binance");
+
+        assert_eq!(first, replay);
+        assert_ne!(first, changed);
     }
 }

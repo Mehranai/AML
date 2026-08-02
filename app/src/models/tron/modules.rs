@@ -1,5 +1,6 @@
 use clickhouse::Row;
-use serde::Serialize;
+use clickhouse::types::UInt256;
+use serde::{Deserialize, Serialize};
 
 //
 // ======================================================
@@ -23,13 +24,13 @@ pub struct TransactionRow {
 
     pub contract_type: String,
 
-    pub amount: u128,
+    pub amount: UInt256,
 
-    pub fee: u128,
+    pub fee: UInt256,
 
-    pub energy_fee: u128,
+    pub energy_fee: UInt256,
 
-    pub net_fee: u128,
+    pub net_fee: UInt256,
 
     pub energy_usage: u64,
 
@@ -44,58 +45,91 @@ pub struct TransactionRow {
 
 //
 // ======================================================
-// TOKEN TRANSFERS
+// SEMANTIC AML EVENTS
 // ======================================================
 //
 
 #[derive(Debug, Row, Serialize, Clone)]
-pub struct TronTokenTransferRow {
+pub struct SemanticAmlEventRow {
+    pub event_id: String,
+    pub chain: String,
     pub tx_hash: String,
-
     pub block_number: u64,
-
     pub timestamp: u64,
-
-    pub log_index: u32,
-
-    pub token_address: String,
-
-    pub from_address: String,
-
-    pub to_address: String,
-
-    pub amount: u128,
-
-    pub is_mint: u8,
-
-    pub is_burn: u8,
-
-    pub event_signature: String,
+    pub event_type: String,
+    pub subject_address: String,
+    pub protocol: String,
+    pub asset_in: String,
+    pub asset_out: String,
+    pub detector: String,
+    pub detector_version: String,
+    pub confidence: f32,
+    pub evidence_json: String,
 }
 
-//
-// ======================================================
-// RAW LOGS
-// ======================================================
-//
+#[derive(Debug, Row, Serialize, Clone)]
+pub struct IngestedBlockRow {
+    pub chain: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub parent_hash: String,
+    pub block_timestamp: u64,
+    pub transaction_count: u32,
+    pub finality_status: String,
+    pub ingestion_status: String,
+    pub error_message: String,
+    pub indexed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Row, Serialize, Deserialize, Clone)]
+pub struct IngestionFailureRow {
+    pub failure_id: String,
+    pub chain: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub tx_hash: String,
+    pub stage: String,
+    pub error_class: String,
+    pub error_message: String,
+    pub retryable: u8,
+    pub attempt_count: u32,
+    pub status: String,
+    pub first_failed_at_unix_ms: u64,
+    pub last_failed_at_unix_ms: u64,
+    pub resolved_at_unix_ms: u64,
+}
 
 #[derive(Debug, Row, Serialize, Clone)]
-pub struct TronRawLogRow {
-    pub tx_hash: String,
+pub struct IngestionBenchmarkRow {
+    pub run_id: String,
+    pub chain: String,
+    pub source_kind: String,
+    pub start_block: u64,
+    pub end_block: u64,
+    pub requested_blocks: u32,
+    pub completed_blocks: u32,
+    pub transaction_count: u64,
+    pub elapsed_ms: u64,
+    pub blocks_per_second: f64,
+    pub transactions_per_second: f64,
+    pub rows_before: u64,
+    pub rows_after: u64,
+    pub compressed_bytes_before: u64,
+    pub compressed_bytes_after: u64,
+    pub investigation_address: String,
+    pub investigation_latency_ms: u64,
+    pub status: String,
+    pub error_message: String,
+    pub metrics_json: String,
+    pub started_at_unix_ms: u64,
+    pub completed_at_unix_ms: u64,
+}
 
-    pub block_number: u64,
-
-    pub log_index: u32,
-
-    pub contract_address: String,
-
-    pub topics: Vec<String>,
-
-    pub data: String,
-
-    pub removed: u8,
-
-    pub timestamp: u64,
+#[derive(Debug, Row, Serialize, Clone)]
+pub struct TokenMetadataDiscoveryRow {
+    pub token_address: String,
+    pub discovered_block: u64,
+    pub discovered_at_unix_ms: u64,
 }
 
 //
@@ -147,41 +181,4 @@ pub struct TransactionFeatureRow {
     pub fan_in: u16,
 
     pub fan_out: u16,
-}
-
-//
-// ======================================================
-// TRANSACTION RISK
-// ======================================================
-//
-
-#[derive(Debug, Row, Serialize, Clone)]
-pub struct TransactionRiskRow {
-    pub tx_hash: String,
-
-    pub block_number: u64,
-
-    pub timestamp: u64,
-
-    pub risk_score: u8,
-
-    pub risk_level: String,
-
-    pub transaction_type: String,
-
-    pub transaction_subtype: String,
-
-    pub is_swap: u8,
-
-    pub is_bridge: u8,
-
-    pub is_contract_call: u8,
-
-    pub unique_tokens: u16,
-
-    pub participants: u16,
-
-    pub risk_reasons: Vec<String>,
-
-    pub touches_exchange: u8,
 }

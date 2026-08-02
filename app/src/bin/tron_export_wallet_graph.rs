@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let graph = build_wallet_flow_graph(clickhouse, &neo4j, &address, depth, limit)
+    let graph = build_wallet_flow_graph(clickhouse, Some(&neo4j), &address, depth, limit)
         .await
         .with_context(|| {
             format!(

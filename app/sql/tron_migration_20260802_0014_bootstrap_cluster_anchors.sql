@@ -1,0 +1,179 @@
+INSERT INTO tron_db.address_cluster_claims
+(
+    claim_id,
+    chain,
+    address,
+    cluster_id,
+    cluster_type,
+    address_role,
+    claim_method,
+    confidence,
+    source,
+    source_record_id,
+    evidence_tx_hashes,
+    evidence_addresses,
+    evidence_json,
+    supersedes_claim_id,
+    review_status,
+    created_by,
+    created_at_unix_ms
+)
+VALUES
+(
+    'tron_bootstrap_cluster_claim_binance',
+    'tron',
+    'TAUN6FwrnwwmaEqYcckffC7wYmbaS6cBiX',
+    'cluster:tron:exchange:binance',
+    'EXCHANGE_SERVICE',
+    'HOT',
+    'VERIFIED_SERVICE_ANCHOR',
+    1.0,
+    'tron_builtin_verified_seeds',
+    'bootstrap:binance:cluster-anchor:1',
+    [],
+    [],
+    '{"method_version":1,"anchor_type":"verified_service_address"}',
+    '',
+    'APPROVED',
+    'schema_migration',
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+),
+(
+    'tron_bootstrap_cluster_claim_okx',
+    'tron',
+    'TU2TmqauSEiRf16CyFgzHV2BVxBejY9iyR',
+    'cluster:tron:exchange:okx',
+    'EXCHANGE_SERVICE',
+    'HOT',
+    'VERIFIED_SERVICE_ANCHOR',
+    1.0,
+    'tron_builtin_verified_seeds',
+    'bootstrap:okx:cluster-anchor:1',
+    [],
+    [],
+    '{"method_version":1,"anchor_type":"verified_service_address"}',
+    '',
+    'APPROVED',
+    'schema_migration',
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+);
+
+INSERT INTO tron_db.intelligence_reviews
+(
+    review_id,
+    chain,
+    subject_type,
+    subject_id,
+    decision,
+    reviewer,
+    reason,
+    evidence_refs,
+    created_at_unix_ms
+)
+VALUES
+(
+    'tron_bootstrap_cluster_review_binance',
+    'tron',
+    'CLUSTER_CLAIM',
+    'tron_bootstrap_cluster_claim_binance',
+    'APPROVED',
+    'schema_migration',
+    'Verified exchange service anchor',
+    ['internal:verified-bootstrap-seed'],
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+),
+(
+    'tron_bootstrap_cluster_review_okx',
+    'tron',
+    'CLUSTER_CLAIM',
+    'tron_bootstrap_cluster_claim_okx',
+    'APPROVED',
+    'schema_migration',
+    'Verified exchange service anchor',
+    ['internal:verified-bootstrap-seed'],
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+);
+
+INSERT INTO tron_db.address_cluster_memberships
+(
+    chain,
+    address,
+    cluster_id,
+    cluster_type,
+    address_role,
+    confidence,
+    source_claim_id,
+    review_id,
+    cluster_version,
+    is_active,
+    created_at_unix_ms
+)
+VALUES
+(
+    'tron',
+    'TAUN6FwrnwwmaEqYcckffC7wYmbaS6cBiX',
+    'cluster:tron:exchange:binance',
+    'EXCHANGE_SERVICE',
+    'HOT',
+    1.0,
+    'tron_bootstrap_cluster_claim_binance',
+    'tron_bootstrap_cluster_review_binance',
+    1,
+    1,
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+),
+(
+    'tron',
+    'TU2TmqauSEiRf16CyFgzHV2BVxBejY9iyR',
+    'cluster:tron:exchange:okx',
+    'EXCHANGE_SERVICE',
+    'HOT',
+    1.0,
+    'tron_bootstrap_cluster_claim_okx',
+    'tron_bootstrap_cluster_review_okx',
+    1,
+    1,
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+);
+
+INSERT INTO tron_db.cluster_versions
+(
+    chain,
+    cluster_id,
+    version,
+    cluster_type,
+    display_name,
+    change_type,
+    change_reason,
+    source_claim_ids,
+    active_member_count,
+    created_by,
+    created_at_unix_ms
+)
+VALUES
+(
+    'tron',
+    'cluster:tron:exchange:binance',
+    1,
+    'EXCHANGE_SERVICE',
+    'Binance service cluster',
+    'CLUSTER_CREATED',
+    'Verified exchange service anchor',
+    ['tron_bootstrap_cluster_claim_binance'],
+    1,
+    'schema_migration',
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+),
+(
+    'tron',
+    'cluster:tron:exchange:okx',
+    1,
+    'EXCHANGE_SERVICE',
+    'OKX service cluster',
+    'CLUSTER_CREATED',
+    'Verified exchange service anchor',
+    ['tron_bootstrap_cluster_claim_okx'],
+    1,
+    'schema_migration',
+    toUInt64(toUnixTimestamp64Milli(now64(3)))
+);

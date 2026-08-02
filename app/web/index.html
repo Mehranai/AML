@@ -142,7 +142,7 @@
 
     .search {
       display: grid;
-      grid-template-columns: minmax(220px, 1fr) 86px 100px 118px;
+      grid-template-columns: minmax(220px, 1fr) 86px 100px 110px 118px;
       gap: 8px;
       align-items: center;
     }
@@ -195,7 +195,7 @@
 
     .path-actions {
       display: grid;
-      grid-template-columns: 92px 1fr;
+      grid-template-columns: 92px 112px minmax(0, 1fr);
       gap: 8px;
       align-items: center;
     }
@@ -239,11 +239,12 @@
       gap: 12px;
       min-width: 0;
       min-height: 0;
+      overflow: hidden;
     }
 
     .metrics {
       display: grid;
-      grid-template-columns: repeat(6, minmax(110px, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
     }
 
@@ -362,9 +363,14 @@
       stroke-width: 2.4;
     }
 
-    .edge.risk-high {
-      stroke: var(--red);
-      stroke-width: 2.8;
+    .edge.dense {
+      stroke-width: 0.9;
+      opacity: 0.56;
+    }
+
+    .edge.exchange.dense {
+      stroke-width: 1.25;
+      opacity: 0.72;
     }
 
     .edge-label {
@@ -416,8 +422,12 @@
       height: 100%;
       max-height: 100%;
       min-height: 0;
+      min-width: 0;
       overflow: hidden;
       overscroll-behavior: contain;
+      position: relative;
+      z-index: 2;
+      background: var(--bg);
     }
 
     .inspector-tabs {
@@ -605,11 +615,71 @@
       overflow-wrap: anywhere;
     }
 
+    .list-item small {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
     .list-item strong {
       flex: 0 0 auto;
       color: var(--ink);
       font-size: 12px;
       text-align: right;
+    }
+
+    .section-label {
+      margin: 16px 0 6px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+
+    .trend-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .trend-row {
+      display: grid;
+      grid-template-columns: 76px minmax(0, 1fr) 54px;
+      gap: 8px;
+      align-items: center;
+      font-size: 11px;
+    }
+
+    .trend-row time,
+    .trend-row strong {
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .trend-row strong {
+      color: var(--ink);
+      text-align: right;
+    }
+
+    .trend-bars {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .trend-bar {
+      display: block;
+      width: 0;
+      min-width: 2px;
+      height: 5px;
+      border-radius: 2px;
+      background: var(--teal);
+    }
+
+    .trend-bar.outgoing {
+      background: #b76e00;
     }
 
     .table-wrap {
@@ -750,8 +820,7 @@
       <nav class="nav" aria-label="Primary">
         <button class="active" type="button"><span class="nav-dot"></span>Flow Graph</button>
         <button type="button"><span class="nav-dot" style="background:#b76e00"></span>Exchange Intel</button>
-        <button type="button"><span class="nav-dot" style="background:#b12a34"></span>Risk</button>
-        <button type="button"><span class="nav-dot" style="background:#6750a4"></span>Neo4j</button>
+        <button type="button"><span class="nav-dot" style="background:#6750a4"></span>Wallet Paths</button>
       </nav>
       <div class="sidebar-foot">
         <span>ClickHouse: source of truth</span>
@@ -776,6 +845,13 @@
             <option value="500" selected>500 edges</option>
             <option value="1000">1000 edges</option>
           </select>
+          <select class="select" id="windowInput" name="window" aria-label="Activity window">
+            <option value="30">30 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="365">1 year</option>
+            <option value="1825">5 years</option>
+            <option value="3650">All indexed</option>
+          </select>
           <button class="primary" id="searchButton" type="submit">Trace</button>
         </form>
         <div class="status" id="statusText"><span class="pulse"></span>Ready</div>
@@ -787,9 +863,9 @@
             <div class="metric"><span>Nodes</span><strong id="metricNodes">0</strong></div>
             <div class="metric"><span>Edges</span><strong id="metricEdges">0</strong></div>
             <div class="metric"><span>Exchanges</span><strong id="metricExchanges">0</strong></div>
-            <div class="metric"><span>AML risk</span><strong id="metricRisk">0%</strong></div>
+            <div class="metric"><span>AML events</span><strong id="metricAmlEvents">0</strong></div>
             <div class="metric"><span>Assets</span><strong id="metricAssets">0</strong></div>
-            <div class="metric"><span>Neo4j edges</span><strong id="metricNeo4j">0</strong></div>
+            <div class="metric"><span>Projected edges</span><strong id="metricNeo4j">0</strong></div>
           </section>
 
           <section class="panel graph-panel">
@@ -805,11 +881,6 @@
                 </select>
               </label>
               <label class="control">
-                Min risk
-                <input class="range" id="riskFilter" min="0" max="100" value="0" type="range">
-                <span id="riskValue">0</span>
-              </label>
-              <label class="control">
                 <input id="exchangeOnly" type="checkbox">
                 Exchange only
               </label>
@@ -823,35 +894,17 @@
 
         <aside class="aside">
           <div class="inspector-tabs" role="tablist" aria-label="Investigation panels">
-            <button class="inspector-tab" type="button" role="tab" data-inspector-tab="risk">Risk</button>
             <button class="inspector-tab" type="button" role="tab" data-inspector-tab="fingerprint">Fingerprint</button>
+            <button class="inspector-tab" type="button" role="tab" data-inspector-tab="flows">Flows</button>
+            <button class="inspector-tab" type="button" role="tab" data-inspector-tab="identity">Identity</button>
             <button class="inspector-tab active" type="button" role="tab" data-inspector-tab="holdings" aria-selected="true">Holdings</button>
             <button class="inspector-tab" type="button" role="tab" data-inspector-tab="quality">Quality</button>
             <button class="inspector-tab" type="button" role="tab" data-inspector-tab="node">Node</button>
             <button class="inspector-tab" type="button" role="tab" data-inspector-tab="exchanges">Exchanges</button>
-            <button class="inspector-tab" type="button" role="tab" data-inspector-tab="neo4j">Neo4j</button>
+            <button class="inspector-tab" type="button" role="tab" data-inspector-tab="paths">Paths</button>
           </div>
 
           <div class="inspector-body">
-          <section class="panel inspector-panel" data-inspector-panel="risk" role="tabpanel">
-            <div class="panel-head">
-              <strong>ML Risk</strong>
-              <span class="badge" id="riskBadge">Not scored</span>
-            </div>
-            <div class="panel-body">
-              <div class="kv">
-                <div class="kv-row"><span>Probability</span><strong id="riskPercent">-</strong></div>
-                <div class="kv-row"><span>Model Confidence</span><strong id="riskConfidence">-</strong></div>
-                <div class="kv-row"><span>Status</span><strong id="aiRiskPercent">-</strong></div>
-                <div class="kv-row"><span>Model</span><strong id="aiRiskModel">-</strong></div>
-                <div class="kv-row"><span>Exposure</span><strong id="riskExposure">-</strong></div>
-                <div class="kv-row"><span>Snapshot</span><strong id="riskModel">-</strong></div>
-                <div class="kv-row"><span>Prediction</span><strong id="riskRecord">-</strong></div>
-              </div>
-              <div class="list" id="riskTypologies"></div>
-            </div>
-          </section>
-
           <section class="panel inspector-panel" data-inspector-panel="fingerprint" role="tabpanel">
             <div class="panel-head">
               <strong>Fingerprint</strong>
@@ -864,6 +917,47 @@
                 <div class="kv-row"><span>Transfers</span><strong id="walletTransfers">-</strong></div>
                 <div class="kv-row"><span>Swap / Bridge</span><strong id="walletDefi">-</strong></div>
               </div>
+            </div>
+          </section>
+
+          <section class="panel inspector-panel" data-inspector-panel="flows" role="tabpanel">
+            <div class="panel-head">
+              <strong>Fund Flow Activity</strong>
+              <span class="badge" id="activityBadge">No activity</span>
+            </div>
+            <div class="panel-body">
+              <div class="kv">
+                <div class="kv-row"><span>Incoming / Outgoing</span><strong id="flowDirections">-</strong></div>
+                <div class="kv-row"><span>Senders / Receivers</span><strong id="flowCounterparties">-</strong></div>
+                <div class="kv-row"><span>Window</span><strong id="flowWindow">-</strong></div>
+                <div class="kv-row"><span>Semantic events</span><strong id="flowEventCount">0</strong></div>
+              </div>
+              <div class="section-label">Operations</div>
+              <div class="list" id="operationSummary"></div>
+              <div class="section-label">Flow Trend</div>
+              <div class="trend-list" id="flowTrend"></div>
+              <div class="section-label">Outgoing To</div>
+              <div class="list" id="outgoingCounterparties"></div>
+              <div class="section-label">Incoming From</div>
+              <div class="list" id="incomingCounterparties"></div>
+              <div class="section-label">AML Activity Evidence</div>
+              <div class="list" id="semanticEventList"></div>
+            </div>
+          </section>
+
+          <section class="panel inspector-panel" data-inspector-panel="identity" role="tabpanel">
+            <div class="panel-head">
+              <strong>Entity Intelligence</strong>
+              <span class="badge" id="intelligenceBadge">Unattributed</span>
+            </div>
+            <div class="panel-body">
+              <div class="kv">
+                <div class="kv-row"><span>Entity</span><strong id="intelligenceEntity">-</strong></div>
+                <div class="kv-row"><span>Role</span><strong id="intelligenceRole">-</strong></div>
+                <div class="kv-row"><span>Clusters</span><strong id="intelligenceClusters">0</strong></div>
+                <div class="kv-row"><span>Pending review</span><strong id="intelligencePending">0</strong></div>
+              </div>
+              <div class="list" id="intelligenceClaims"></div>
             </div>
           </section>
 
@@ -934,9 +1028,9 @@
             </div>
           </section>
 
-          <section class="panel drawer inspector-panel" data-inspector-panel="neo4j" role="tabpanel">
+          <section class="panel drawer inspector-panel" data-inspector-panel="paths" role="tabpanel">
             <div class="panel-head">
-              <strong>Neo4j</strong>
+              <strong>Wallet Paths</strong>
               <a class="badge" id="neo4jLink" href="#" target="_blank" rel="noreferrer">Browser</a>
             </div>
             <div class="panel-body">
@@ -958,11 +1052,17 @@
                     <option value="9">9 hops</option>
                     <option value="10" selected>10 hops</option>
                   </select>
+                  <select class="select" id="pathDirectionInput" aria-label="Path direction">
+                    <option value="outgoing" selected>Outgoing</option>
+                    <option value="any">Any direction</option>
+                    <option value="incoming">Incoming</option>
+                  </select>
                   <button class="secondary" id="pathButton" type="submit">Find Path</button>
                 </div>
               </form>
               <div class="path-summary" id="pathSummary">No wallet path search loaded.</div>
               <div class="list" id="pathList" style="margin-bottom:12px"></div>
+              <button class="secondary" id="projectButton" type="button" style="width:100%;margin-bottom:12px">Project visible graph to Neo4j</button>
               <div class="kv" style="margin-bottom:12px">
                 <div class="kv-row"><span>Wallet nodes</span><strong id="neoWalletNodes">0</strong></div>
                 <div class="kv-row"><span>Transfer edges</span><strong id="neoTransferEdges">0</strong></div>
@@ -985,14 +1085,14 @@
       graph: null,
       holdings: null,
       fingerprint: null,
-      aiRisk: null,
+      activity: null,
+      intelligence: null,
       dataQuality: null,
       pathResult: null,
       inspectorTab: 'holdings',
       selectedNodeId: null,
       filter: {
         operation: 'all',
-        risk: 0,
         exchangeOnly: false
       }
     };
@@ -1002,6 +1102,7 @@
       wallet: document.getElementById('walletInput'),
       depth: document.getElementById('depthInput'),
       limit: document.getElementById('limitInput'),
+      window: document.getElementById('windowInput'),
       button: document.getElementById('searchButton'),
       status: document.getElementById('statusText'),
       activeAddress: document.getElementById('activeAddress'),
@@ -1009,14 +1110,14 @@
       graphWrap: document.getElementById('graphWrap'),
       empty: document.getElementById('emptyState'),
       operationFilter: document.getElementById('operationFilter'),
-      riskFilter: document.getElementById('riskFilter'),
-      riskValue: document.getElementById('riskValue'),
       exchangeOnly: document.getElementById('exchangeOnly'),
       pathForm: document.getElementById('pathForm'),
       pathSource: document.getElementById('pathSourceInput'),
       pathTarget: document.getElementById('pathTargetInput'),
       pathDepth: document.getElementById('pathDepthInput'),
+      pathDirection: document.getElementById('pathDirectionInput'),
       pathButton: document.getElementById('pathButton'),
+      projectButton: document.getElementById('projectButton'),
       pathSummary: document.getElementById('pathSummary'),
       pathList: document.getElementById('pathList'),
       inspectorTabs: Array.from(document.querySelectorAll('[data-inspector-tab]')),
@@ -1034,14 +1135,12 @@
       loadWalletPath();
     });
 
-    els.operationFilter.addEventListener('change', () => {
-      state.filter.operation = els.operationFilter.value;
-      renderAll();
+    els.projectButton.addEventListener('click', () => {
+      projectVisibleGraph();
     });
 
-    els.riskFilter.addEventListener('input', () => {
-      state.filter.risk = Number(els.riskFilter.value);
-      els.riskValue.textContent = String(state.filter.risk);
+    els.operationFilter.addEventListener('change', () => {
+      state.filter.operation = els.operationFilter.value;
       renderAll();
     });
 
@@ -1068,6 +1167,7 @@
       const address = els.wallet.value.trim();
       const depth = Number(els.depth.value);
       const limit = Number(els.limit.value);
+      const windowDays = Number(els.window.value || 90);
 
       if (!address) {
         showToast('Wallet address is required.');
@@ -1080,7 +1180,7 @@
         const query = new URLSearchParams({
           depth: String(depth),
           limit: String(limit),
-          window_days: '90',
+          window_days: String(windowDays),
           top_counterparties: '25',
           max_events: '20000',
           holdings_limit: '100'
@@ -1098,7 +1198,8 @@
         state.graph = state.investigation.graph;
         state.holdings = state.investigation.holdings;
         state.fingerprint = state.investigation.fingerprint;
-        state.aiRisk = state.investigation.ai_risk;
+        state.activity = state.investigation.activity;
+        state.intelligence = state.investigation.intelligence;
         state.dataQuality = state.investigation.data_quality;
         state.pathResult = null;
         state.selectedNodeId = state.graph.address;
@@ -1120,6 +1221,7 @@
       const source = els.pathSource.value.trim() || els.wallet.value.trim();
       const target = els.pathTarget.value.trim();
       const maxDepth = Number(els.pathDepth.value || 10);
+      const direction = els.pathDirection.value || 'outgoing';
 
       if (!source || !target) {
         showToast('Source and target wallets are required.');
@@ -1133,7 +1235,7 @@
           max_depth: String(maxDepth),
           limit: '20',
           per_address_limit: '500',
-          direction: 'outgoing'
+          direction
         });
         const response = await fetch(`/api/tron/wallet/${encodeURIComponent(source)}/paths/${encodeURIComponent(target)}?${query.toString()}`, {
           headers: { accept: 'application/json' }
@@ -1147,7 +1249,7 @@
         state.pathResult = await response.json();
         state.graph = state.pathResult;
         state.selectedNodeId = state.pathResult.source_address;
-        state.inspectorTab = 'neo4j';
+        state.inspectorTab = 'paths';
         els.activeAddress.textContent = `${shortAddress(state.pathResult.source_address)} -> ${shortAddress(state.pathResult.target_address)}`;
         hydrateOperationFilter();
         renderAll();
@@ -1156,6 +1258,65 @@
         showToast(error.message || 'Failed to load wallet path.');
       } finally {
         setPathLoading(false);
+      }
+    }
+
+    async function projectVisibleGraph() {
+      const walletAddress = els.wallet.value.trim();
+
+      if (!state.graph || (!state.pathResult && !walletAddress)) {
+        showToast('Load a wallet graph or wallet path first.');
+        return;
+      }
+
+      els.projectButton.disabled = true;
+      els.projectButton.textContent = 'Projecting...';
+
+      try {
+        let endpoint;
+
+        if (state.pathResult) {
+          const source = state.pathResult.source_address;
+          const target = state.pathResult.target_address;
+          const query = new URLSearchParams({
+            max_depth: String(state.pathResult.max_depth || 10),
+            limit: '20',
+            per_address_limit: '500',
+            direction: state.pathResult.direction || 'outgoing'
+          });
+          endpoint = `/api/tron/wallet/${encodeURIComponent(source)}/paths/${encodeURIComponent(target)}/neo4j/import?${query.toString()}`;
+        } else {
+          const query = new URLSearchParams({
+            depth: String(Number(els.depth.value || 3)),
+            limit: String(Number(els.limit.value || 500))
+          });
+          endpoint = `/api/tron/wallet/${encodeURIComponent(walletAddress)}/neo4j/import?${query.toString()}`;
+        }
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { accept: 'application/json' }
+        });
+
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || `Request failed with ${response.status}`);
+        }
+
+        const projected = await response.json();
+        state.graph = projected;
+        if (state.pathResult) {
+          state.pathResult = projected;
+        } else if (state.investigation) {
+          state.investigation.graph = projected;
+        }
+        renderAll();
+        showToast('Visible graph projected to Neo4j.');
+      } catch (error) {
+        showToast(error.message || 'Failed to project graph to Neo4j.');
+      } finally {
+        els.projectButton.disabled = false;
+        els.projectButton.textContent = 'Project visible graph to Neo4j';
       }
     }
 
@@ -1181,8 +1342,9 @@
     function renderAll() {
       renderInspectorTabs();
       renderMetrics();
-      renderRisk();
       renderFingerprint();
+      renderActivity();
+      renderIntelligence();
       renderHoldings();
       renderDataQuality();
       renderGraph();
@@ -1221,12 +1383,11 @@
       return (state.graph.edges || []).filter((edge) => {
         const operation = edge.operation_type || edge.transfer_type || 'transfer';
         const opMatch = state.filter.operation === 'all' || operation === state.filter.operation;
-        const riskMatch = Number(edge.risk_score || 0) >= state.filter.risk;
         const from = nodesById.get(edge.from);
         const to = nodesById.get(edge.to);
         const exchangeMatch = !state.filter.exchangeOnly || Boolean(edge.exchange_name || from?.exchange_name || to?.exchange_name);
 
-        return opMatch && riskMatch && exchangeMatch;
+        return opMatch && exchangeMatch;
       });
     }
 
@@ -1266,60 +1427,13 @@
       document.getElementById('metricNodes').textContent = String(nodes.length);
       document.getElementById('metricEdges').textContent = String(edges.length);
       document.getElementById('metricExchanges').textContent = String(exchangeNames.size);
-      const riskPercent = state.aiRisk?.risk_percent;
-      document.getElementById('metricRisk').textContent = state.aiRisk?.status === 'DISABLED'
-        ? 'Off'
-        : riskPercent == null ? 'Pending' : `${riskPercent}%`;
-      document.getElementById('metricAssets').textContent = String(state.holdings?.total_asset_count || 0);
+      document.getElementById('metricAmlEvents').textContent = state.pathResult
+        ? '-'
+        : String(state.activity?.summary?.semantic_event_count || 0);
+      document.getElementById('metricAssets').textContent = state.pathResult
+        ? '-'
+        : String(state.holdings?.total_asset_count || 0);
       document.getElementById('metricNeo4j').textContent = String(graph?.neo4j?.imported_transfer_edges || 0);
-    }
-
-    function renderRisk() {
-      const aiRisk = state.aiRisk;
-      const badge = document.getElementById('riskBadge');
-      const typologies = document.getElementById('riskTypologies');
-
-      if (!aiRisk) {
-        badge.textContent = 'Not scored';
-        badge.className = 'badge';
-        document.getElementById('riskPercent').textContent = '-';
-        document.getElementById('riskConfidence').textContent = '-';
-        document.getElementById('aiRiskPercent').textContent = '-';
-        document.getElementById('aiRiskModel').textContent = '-';
-        document.getElementById('riskExposure').textContent = '-';
-        document.getElementById('riskModel').textContent = '-';
-        document.getElementById('riskRecord').textContent = '-';
-        typologies.innerHTML = '';
-        return;
-      }
-
-      const hasProbability = aiRisk.risk_percent != null;
-      badge.textContent = hasProbability ? (aiRisk.risk_level || 'UNKNOWN') : (aiRisk.status || 'MODEL');
-      badge.className = `badge ${hasProbability ? riskBadgeClass(aiRisk.risk_level) : 'warn'}`;
-      document.getElementById('riskPercent').textContent = hasProbability ? `${aiRisk.risk_percent}%` : '-';
-      document.getElementById('riskConfidence').textContent = aiRisk.confidence == null ? '-' : `${Math.round(Number(aiRisk.confidence || 0) * 100)}%`;
-      document.getElementById('aiRiskPercent').textContent = escapeHtml(titleCase(aiRisk.status || '-'));
-      document.getElementById('aiRiskModel').textContent = aiRisk.model_version || aiRisk.model_id || '-';
-      const features = aiRisk.feature_snapshot?.features || {};
-      const exposureScore = Math.round(Number(features.exposure_score || 0) * 100);
-      const exposureSources = Number(features.exposure_source_count || 0);
-      const exposurePaths = Number(features.exposure_path_count || 0);
-      document.getElementById('riskExposure').textContent = `${exposureScore}% / ${exposureSources} src / ${exposurePaths} paths`;
-      document.getElementById('riskModel').textContent = aiRisk.snapshot_id ? shortHash(aiRisk.snapshot_id) : '-';
-      document.getElementById('riskRecord').textContent = aiRisk.prediction_id ? shortHash(aiRisk.prediction_id) : (aiRisk.persistence ? 'snapshot stored' : 'not stored');
-
-      const items = (aiRisk.model_patterns || []).length
-        ? aiRisk.model_patterns
-        : (aiRisk.feature_importance || []);
-
-      typologies.innerHTML = items.length
-        ? items.slice(0, 6).map((item) => `
-          <div class="list-item">
-            <span>${escapeHtml(titleCase(item.pattern || item.feature || '-'))}</span>
-            <strong>${escapeHtml(titleCase(item.direction || ''))}</strong>
-          </div>
-        `).join('')
-        : `<div class="list-item"><span>${escapeHtml(aiRisk.message || 'No model output yet')}</span><strong>-</strong></div>`;
     }
 
     function renderFingerprint() {
@@ -1342,6 +1456,158 @@
       document.getElementById('walletBehavior').textContent = fingerprint.fingerprint_label || titleCase(fingerprint.wallet_type || '-');
       document.getElementById('walletTransfers').textContent = `${fingerprint.flows?.total_transfers || 0} / ${fingerprint.flows?.unique_transactions || 0} tx`;
       document.getElementById('walletDefi').textContent = `${percent(fingerprint.behavior?.swap_ratio)} / ${percent(fingerprint.behavior?.bridge_ratio)}`;
+    }
+
+    function renderActivity() {
+      const activity = state.activity;
+      const fingerprint = state.fingerprint;
+      const badge = document.getElementById('activityBadge');
+      const operationSummary = document.getElementById('operationSummary');
+      const trendList = document.getElementById('flowTrend');
+      const outgoingList = document.getElementById('outgoingCounterparties');
+      const incomingList = document.getElementById('incomingCounterparties');
+      const eventList = document.getElementById('semanticEventList');
+
+      if (!activity) {
+        badge.textContent = 'No activity';
+        badge.className = 'badge';
+        document.getElementById('flowDirections').textContent = '-';
+        document.getElementById('flowCounterparties').textContent = '-';
+        document.getElementById('flowWindow').textContent = '-';
+        document.getElementById('flowEventCount').textContent = '0';
+        operationSummary.innerHTML = '';
+        trendList.innerHTML = '';
+        outgoingList.innerHTML = '';
+        incomingList.innerHTML = '';
+        eventList.innerHTML = '';
+        return;
+      }
+
+      const summary = activity.summary || {};
+      const flows = fingerprint?.flows || {};
+      const totalTransfers = Number(summary.incoming_transfers || 0) + Number(summary.outgoing_transfers || 0);
+      const eventCount = Number(summary.semantic_event_count || 0);
+      badge.textContent = `${totalTransfers} flow${totalTransfers === 1 ? '' : 's'}`;
+      badge.className = `badge ${totalTransfers ? 'ok' : ''}`;
+      document.getElementById('flowDirections').textContent = `${summary.incoming_transfers || 0} / ${summary.outgoing_transfers || 0}`;
+      document.getElementById('flowCounterparties').textContent = `${flows.unique_senders || 0} / ${flows.unique_receivers || 0}`;
+      document.getElementById('flowWindow').textContent = `${activity.window_days || 0} days / ${titleCase(activity.bucket_unit || '-')}`;
+      document.getElementById('flowEventCount').textContent = activity.semantic_events_truncated
+        ? `${eventCount} (${activity.semantic_event_limit} shown)`
+        : String(eventCount);
+
+      const operations = [
+        ['Swap', summary.swap_transactions],
+        ['Bridge', summary.bridge_transactions],
+        ['Liquidity add', summary.liquidity_add_transactions],
+        ['Liquidity remove', summary.liquidity_remove_transactions],
+        ['Mint', summary.mint_transactions],
+        ['Burn', summary.burn_transactions],
+        ['Contract call', summary.contract_call_transactions]
+      ];
+      operationSummary.innerHTML = operations.map(([label, count]) => `
+        <div class="list-item"><span>${escapeHtml(label)}</span><strong>${Number(count || 0)} tx</strong></div>
+      `).join('');
+
+      const trend = (activity.trend || []).slice(-30);
+      const peak = Math.max(1, ...trend.flatMap((bucket) => [
+        Number(bucket.incoming_transfers || 0),
+        Number(bucket.outgoing_transfers || 0)
+      ]));
+      trendList.innerHTML = trend.length
+        ? trend.map((bucket) => {
+            const incoming = Number(bucket.incoming_transfers || 0);
+            const outgoing = Number(bucket.outgoing_transfers || 0);
+            const incomingWidth = Math.max(2, Math.round(incoming / peak * 100));
+            const outgoingWidth = Math.max(2, Math.round(outgoing / peak * 100));
+            return `
+              <div class="trend-row">
+                <time>${escapeHtml(formatBucket(bucket.bucket_start_unix_ms, activity.bucket_unit))}</time>
+                <span class="trend-bars">
+                  <span class="trend-bar" style="width:${incomingWidth}%"></span>
+                  <span class="trend-bar outgoing" style="width:${outgoingWidth}%"></span>
+                </span>
+                <strong>${incoming} / ${outgoing}</strong>
+              </div>`;
+          }).join('')
+        : '<div class="list-item"><span>No flow buckets in this window</span><strong>-</strong></div>';
+
+      outgoingList.innerHTML = renderCounterpartyItems(fingerprint?.receivers || []);
+      incomingList.innerHTML = renderCounterpartyItems(fingerprint?.senders || []);
+
+      const events = activity.recent_semantic_events || [];
+      eventList.innerHTML = events.length
+        ? events.map((event) => {
+            const assets = [event.asset_in, event.asset_out].filter(Boolean).map(shortAddress).join(' -> ') || '-';
+            const detail = [event.protocol, assets, formatBucket(event.timestamp, 'day')].filter(Boolean).join(' / ');
+            return `
+              <div class="list-item">
+                <span>${escapeHtml(titleCase(event.event_type || 'event'))}<small>${escapeHtml(detail)}<br>${escapeHtml(shortHash(event.tx_hash || ''))}</small></span>
+                <strong>${Math.round(Number(event.confidence || 0) * 100)}%</strong>
+              </div>`;
+          }).join('')
+        : '<div class="list-item"><span>No semantic AML events in this window</span><strong>-</strong></div>';
+    }
+
+    function renderCounterpartyItems(items) {
+      return items.length
+        ? items.slice(0, 15).map((item) => {
+            const identity = item.identity?.entity_name || item.identity?.exchange_name || item.relationship_label || 'wallet';
+            return `
+              <div class="list-item">
+                <span class="mono">${escapeHtml(shortAddress(item.address || ''))}<small>${escapeHtml(identity)} / ${item.unique_transactions || 0} tx</small></span>
+                <strong>${percent(item.share_of_wallet_transfers)}</strong>
+              </div>`;
+          }).join('')
+        : '<div class="list-item"><span>No counterparties in this window</span><strong>-</strong></div>';
+    }
+
+    function renderIntelligence() {
+      const intelligence = state.intelligence;
+      const badge = document.getElementById('intelligenceBadge');
+      const claims = document.getElementById('intelligenceClaims');
+
+      if (!intelligence) {
+        badge.textContent = 'Unattributed';
+        badge.className = 'badge';
+        document.getElementById('intelligenceEntity').textContent = '-';
+        document.getElementById('intelligenceRole').textContent = '-';
+        document.getElementById('intelligenceClusters').textContent = '0';
+        document.getElementById('intelligencePending').textContent = '0';
+        claims.innerHTML = '';
+        return;
+      }
+
+      const entity = intelligence.active_entity;
+      const exchange = intelligence.active_exchange;
+      const clusters = intelligence.active_clusters || [];
+      const pending = Number(intelligence.pending_review_count || 0);
+      badge.textContent = entity || exchange ? 'Attributed' : pending ? 'Review pending' : 'Unattributed';
+      badge.className = `badge ${entity || exchange ? 'ok' : pending ? 'warn' : ''}`;
+      document.getElementById('intelligenceEntity').textContent = entity?.entity_name || exchange?.exchange_name || '-';
+      document.getElementById('intelligenceRole').textContent = titleCase(exchange?.address_role || clusters[0]?.address_role || entity?.entity_type || '-');
+      document.getElementById('intelligenceClusters').textContent = String(clusters.length);
+      document.getElementById('intelligencePending').textContent = String(pending);
+
+      const entityClaims = (intelligence.entity_claims || []).map((claim) => ({
+        title: claim.entity_name || claim.entity_id,
+        detail: `${titleCase(claim.review_status)} / ${claim.source_name || claim.source_id}`,
+        trust: claim.trust_tier
+      }));
+      const clusterClaims = (intelligence.cluster_claims || []).map((claim) => ({
+        title: `${titleCase(claim.address_role)} cluster`,
+        detail: `${titleCase(claim.review_status)} / ${claim.source_name || claim.source_id}`,
+        trust: claim.trust_tier
+      }));
+      const items = [...entityClaims, ...clusterClaims].slice(0, 10);
+      claims.innerHTML = items.length
+        ? items.map((item) => `
+          <div class="list-item">
+            <span>${escapeHtml(item.title)}<small>${escapeHtml(item.detail)}</small></span>
+            <strong>${escapeHtml(titleCase(item.trust || '-'))}</strong>
+          </div>
+        `).join('')
+        : '<div class="list-item"><span>No submitted identity claims</span><strong>-</strong></div>';
     }
 
     function renderHoldings() {
@@ -1428,6 +1694,7 @@
 
       const edges = filteredEdges();
       const nodes = filteredNodes(edges);
+      const denseGraph = nodes.length > 60 || edges.length > 90;
       const positions = layoutNodes(nodes, edges, graph.address, width, height);
       els.empty.style.display = nodes.length ? 'none' : 'grid';
 
@@ -1438,9 +1705,6 @@
           </marker>
           <marker id="arrowExchange" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="#087f77"></path>
-          </marker>
-          <marker id="arrowRisk" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="#b12a34"></path>
           </marker>
         </defs>`;
 
@@ -1458,14 +1722,13 @@
         const cx = (from.x + to.x) / 2 - dy / 10 + curve;
         const cy = (from.y + to.y) / 2 + dx / 10;
         const isExchange = Boolean(edge.exchange_name || edge.exchange_flow_type);
-        const highRisk = Number(edge.risk_score || 0) >= 70;
-        const markerId = highRisk ? 'arrowRisk' : isExchange ? 'arrowExchange' : 'arrow';
-        const cls = ['edge', isExchange ? 'exchange' : '', highRisk ? 'risk-high' : ''].filter(Boolean).join(' ');
+        const markerId = isExchange ? 'arrowExchange' : 'arrow';
+        const cls = ['edge', isExchange ? 'exchange' : '', denseGraph ? 'dense' : ''].filter(Boolean).join(' ');
         const label = edge.exchange_flow_type || edge.operation_type || edge.transfer_type || 'flow';
 
         return `
           <path class="${cls}" d="M ${from.x} ${from.y} Q ${cx} ${cy} ${to.x} ${to.y}" marker-end="url(#${markerId})"></path>
-          <text class="edge-label" x="${cx}" y="${cy - 6}">${escapeHtml(titleCase(label))}</text>
+          ${denseGraph ? '' : `<text class="edge-label" x="${cx}" y="${cy - 6}">${escapeHtml(titleCase(label))}</text>`}
         `;
       }).join('');
 
@@ -1477,13 +1740,17 @@
         }
 
         const color = nodeColor(node);
-        const radius = node.id === graph.address ? 20 : node.exchange_name ? 17 : 14;
+        const isRoot = node.id === graph.address;
+        const isSelected = state.selectedNodeId === node.id;
+        const isAttributed = Boolean(node.exchange_name || node.entity_name || node.cluster_id);
+        const radius = isRoot ? 20 : node.exchange_name ? (denseGraph ? 11 : 17) : denseGraph ? 5 : 14;
+        const showLabel = !denseGraph || isRoot || isSelected || isAttributed;
         const classes = ['node', node.id === graph.address ? 'root' : '', state.selectedNodeId === node.id ? 'selected' : ''].filter(Boolean).join(' ');
 
         return `
           <g class="${classes}" data-node-id="${escapeAttr(node.id)}" transform="translate(${pos.x} ${pos.y})">
             <circle r="${radius}" fill="${color}"></circle>
-            <text class="node-label" y="${radius + 17}">${escapeHtml(shortAddress(node.label || node.id))}</text>
+            ${showLabel ? `<text class="node-label" y="${radius + 17}">${escapeHtml(shortAddress(node.label || node.id))}</text>` : ''}
           </g>
         `;
       }).join('');
@@ -1636,21 +1903,22 @@
       const depth = Number(result.max_depth || 10);
       const searched = Number(result.searched_node_count || 0);
       const truncated = result.truncated ? ' / capped' : '';
+      const direction = titleCase(result.direction || 'outgoing');
       els.pathSummary.textContent = result.path_count
-        ? `${result.path_count} path(s), ${result.edges?.length || 0} edge(s), ${searched} node expansion(s)${truncated}.`
-        : `No directed path found up to ${depth} hop(s), ${searched} node expansion(s)${truncated}.`;
+        ? `${direction}: ${result.path_count} path(s), ${result.edges?.length || 0} edge(s), ${searched} node expansion(s)${truncated}.`
+        : `No ${direction.toLowerCase()} path found up to ${depth} hop(s), ${searched} node expansion(s)${truncated}.`;
 
       const edgesById = new Map((result.edges || []).map((edge) => [edge.id, edge]));
       els.pathList.innerHTML = (result.paths || []).length
-        ? result.paths.slice(0, 10).map((path) => {
-            const firstEdge = edgesById.get(path.edge_ids?.[0]);
-            const lastEdge = edgesById.get(path.edge_ids?.[path.edge_ids.length - 1]);
-            const token = firstEdge?.token_address || lastEdge?.token_address || '-';
+        ? result.paths.slice(0, 20).map((path) => {
+            const pathEdges = (path.edge_ids || []).map((edgeId) => edgesById.get(edgeId)).filter(Boolean);
+            const operations = Array.from(new Set(pathEdges.map((edge) => titleCase(edge.operation_type || edge.transfer_type || 'transfer')))).join(', ');
+            const tokens = Array.from(new Set(pathEdges.map((edge) => shortAddress(edge.token_address || '-')))).slice(0, 3).join(', ');
             const tail = path.node_ids?.length ? path.node_ids.map(shortAddress).join(' -> ') : '-';
 
             return `
               <div class="list-item">
-                <span>${escapeHtml(tail)}<br><span class="mono">${escapeHtml(shortAddress(token))}</span></span>
+                <span>${escapeHtml(tail)}<small>${escapeHtml(operations || '-')} / ${escapeHtml(tokens || '-')}</small></span>
                 <strong>${Number(path.hop_count || 0)} hop</strong>
               </div>`;
           }).join('')
@@ -1708,20 +1976,6 @@
       return `${node.exchange_name}${node.exchange_role ? ' / ' + node.exchange_role : ''}`;
     }
 
-    function riskBadgeClass(level) {
-      switch ((level || '').toUpperCase()) {
-        case 'LOW':
-          return 'ok';
-        case 'MEDIUM':
-          return 'warn';
-        case 'HIGH':
-        case 'CRITICAL':
-          return 'risk';
-        default:
-          return '';
-      }
-    }
-
     function percent(value) {
       return `${Math.round(Number(value || 0) * 100)}%`;
     }
@@ -1744,6 +1998,18 @@
       }
 
       return String(value).slice(0, 12);
+    }
+
+    function formatBucket(value, unit) {
+      const timestamp = Number(value || 0);
+      if (!timestamp) {
+        return '-';
+      }
+
+      const options = unit === 'day'
+        ? { month: 'short', day: '2-digit' }
+        : { year: '2-digit', month: 'short' };
+      return new Intl.DateTimeFormat('en-US', options).format(new Date(timestamp));
     }
 
     function formatAmount(value) {
@@ -1799,7 +2065,9 @@
 
     function formatAssetHolding(asset) {
       const symbol = asset.asset_symbol || shortAddress(asset.asset_id);
-      const decimal = formatDecimal(asset.balance_decimal);
+      const decimal = asset.metadata_available
+        ? formatDecimal(asset.balance_decimal)
+        : `${asset.balance_raw} raw`;
 
       return `${decimal} ${symbol}`;
     }

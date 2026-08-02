@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
@@ -230,6 +231,7 @@ struct ActiveWalletMlModelRow {
     feature_schema_version: String,
     calibration_version: String,
     artifact_json: String,
+    artifact_sha256: String,
     metrics_json: String,
     model_quality_score: f32,
     trained_at_unix_ms: u64,
@@ -244,6 +246,7 @@ struct ActiveWalletMlModel {
     feature_schema_version: String,
     calibration_version: String,
     artifact_json: String,
+    artifact_sha256: String,
     metrics_json: String,
     model_quality_score: f32,
     trained_at_unix_ms: u64,
@@ -259,6 +262,7 @@ impl From<ActiveWalletMlModelRow> for ActiveWalletMlModel {
             feature_schema_version: row.feature_schema_version,
             calibration_version: row.calibration_version,
             artifact_json: row.artifact_json,
+            artifact_sha256: row.artifact_sha256,
             metrics_json: row.metrics_json,
             model_quality_score: row.model_quality_score,
             trained_at_unix_ms: row.trained_at_unix_ms,
@@ -431,7 +435,45 @@ pub fn build_wallet_feature_snapshot(
 async fn load_active_wallet_ml_model(
     clickhouse: &Client,
 ) -> anyhow::Result<Option<ActiveWalletMlModel>> {
-    let row = clickhouse
+    let deployed = clickhouse
+        .query(
+            r#"
+            SELECT
+                registry.model_id,
+                registry.model_version,
+                registry.model_family,
+                registry.feature_schema_version,
+                registry.calibration_version,
+                registry.artifact_json,
+                registry.artifact_sha256,
+                registry.metrics_json,
+                registry.model_quality_score,
+                registry.trained_at_unix_ms,
+                registry.activated_at_unix_ms
+            FROM wallet_ml_model_registry FINAL AS registry
+            INNER JOIN wallet_ml_model_deployments FINAL AS deployment
+                ON deployment.model_id = registry.model_id
+               AND deployment.model_version = registry.model_version
+               AND deployment.feature_schema_version = registry.feature_schema_version
+            WHERE deployment.environment = 'production'
+              AND deployment.status = 'ACTIVE'
+              AND deployment.feature_schema_version = ?
+            ORDER BY deployment.deployed_at_unix_ms DESC,
+                     registry.activated_at_unix_ms DESC,
+                     registry.trained_at_unix_ms DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(FEATURE_SCHEMA_VERSION)
+        .fetch_optional::<ActiveWalletMlModelRow>()
+        .await
+        .context("failed to load deployed TRON wallet ML model")?;
+
+    if let Some(row) = deployed {
+        return Ok(Some(ActiveWalletMlModel::from(row)));
+    }
+
+    let legacy = clickhouse
         .query(
             r#"
             SELECT
@@ -441,11 +483,12 @@ async fn load_active_wallet_ml_model(
                 feature_schema_version,
                 calibration_version,
                 artifact_json,
+                artifact_sha256,
                 metrics_json,
                 model_quality_score,
                 trained_at_unix_ms,
                 activated_at_unix_ms
-            FROM wallet_ml_model_registry
+            FROM wallet_ml_model_registry FINAL
             WHERE status = 'ACTIVE'
               AND feature_schema_version = ?
             ORDER BY activated_at_unix_ms DESC, trained_at_unix_ms DESC
@@ -455,18 +498,42 @@ async fn load_active_wallet_ml_model(
         .bind(FEATURE_SCHEMA_VERSION)
         .fetch_optional::<ActiveWalletMlModelRow>()
         .await
-        .context("failed to load active TRON wallet ML model")?;
+        .context("failed to load legacy active TRON wallet ML model")?;
 
-    Ok(row.map(ActiveWalletMlModel::from))
+    Ok(legacy.map(ActiveWalletMlModel::from))
 }
 
 fn infer_wallet_ai_risk_with_model(
     snapshot: WalletFeatureSnapshot,
     model: &ActiveWalletMlModel,
 ) -> anyhow::Result<WalletAiRiskAssessment> {
+    let actual_artifact_sha256 = format!("{:x}", Sha256::digest(model.artifact_json.as_bytes()));
+    if !model.artifact_sha256.is_empty() && model.artifact_sha256 != actual_artifact_sha256 {
+        return Err(anyhow!(
+            "active TRON wallet ML model artifact checksum mismatch"
+        ));
+    }
+
     let artifact: WalletMlModelArtifact = serde_json::from_str(&model.artifact_json)
         .context("active TRON wallet ML model artifact is not valid JSON")?;
     validate_artifact(&artifact)?;
+    let registered_family = model.model_family.to_ascii_lowercase();
+    let artifact_family = artifact.model_type.to_ascii_lowercase();
+    let family_matches = registered_family == artifact_family
+        || (matches!(
+            registered_family.as_str(),
+            "logistic_regression" | "binary_logistic_regression"
+        ) && matches!(
+            artifact_family.as_str(),
+            "logistic_regression" | "binary_logistic_regression"
+        ));
+    if !family_matches {
+        return Err(anyhow!(
+            "registered model family {} does not match artifact type {}",
+            model.model_family,
+            artifact.model_type
+        ));
+    }
 
     if model.feature_schema_version != snapshot.feature_schema_version {
         return Err(anyhow!(
@@ -499,7 +566,12 @@ fn infer_wallet_ai_risk_with_model(
         inferred_at_unix_ms,
     );
     let confidence = if model.model_quality_score > 0.0 {
-        Some(clamp01(model.model_quality_score))
+        Some(prediction_confidence(
+            risk_score,
+            model.model_quality_score,
+            &snapshot,
+            &artifact,
+        ))
     } else {
         None
     };
@@ -568,9 +640,8 @@ fn model_disabled_assessment(snapshot: WalletFeatureSnapshot) -> WalletAiRiskAss
 
     WalletAiRiskAssessment {
         status: ML_STATUS_DISABLED.to_string(),
-        message:
-            "TRON wallet AI risk inference is disabled. Set TRON_AI_RISK_ENABLED=true to score wallets."
-                .to_string(),
+        message: "TRON wallet AI risk inference is disabled while graph and evidence workflows are under test."
+            .to_string(),
         prediction_id: None,
         snapshot_id: snapshot.snapshot_id.clone(),
         address: snapshot.address.clone(),
@@ -683,6 +754,20 @@ fn validate_artifact(artifact: &WalletMlModelArtifact) -> anyhow::Result<()> {
     if artifact.feature_names.is_empty() {
         return Err(anyhow!("TRON wallet ML model artifact has no features"));
     }
+    let known_features = MODEL_FEATURE_NAMES.iter().copied().collect::<HashSet<_>>();
+    let mut unique_features = HashSet::new();
+    for feature in &artifact.feature_names {
+        if !known_features.contains(feature.as_str()) {
+            return Err(anyhow!(
+                "TRON wallet ML model artifact requires unknown feature: {feature}"
+            ));
+        }
+        if !unique_features.insert(feature.as_str()) {
+            return Err(anyhow!(
+                "TRON wallet ML model artifact repeats feature: {feature}"
+            ));
+        }
+    }
 
     if !artifact.feature_means.is_empty()
         && artifact.feature_means.len() != artifact.feature_names.len()
@@ -702,6 +787,35 @@ fn validate_artifact(artifact: &WalletMlModelArtifact) -> anyhow::Result<()> {
             artifact.feature_stds.len(),
             artifact.feature_names.len()
         ));
+    }
+    if artifact
+        .feature_means
+        .iter()
+        .any(|value| !value.is_finite())
+        || artifact
+            .feature_stds
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(anyhow!(
+            "TRON wallet ML model artifact has invalid normalization values"
+        ));
+    }
+    if let Some(calibration) = &artifact.calibration {
+        let method = calibration.method.as_deref().unwrap_or("identity");
+        if method.eq_ignore_ascii_case("platt") {
+            let slope = calibration.slope.unwrap_or(1.0);
+            let intercept = calibration.intercept.unwrap_or_default();
+            if !slope.is_finite() || slope <= 0.0 || !intercept.is_finite() {
+                return Err(anyhow!(
+                    "TRON wallet ML model artifact has invalid Platt calibration"
+                ));
+            }
+        } else if !method.eq_ignore_ascii_case("identity") {
+            return Err(anyhow!(
+                "unsupported TRON wallet ML calibration method: {method}"
+            ));
+        }
     }
 
     match model_type.as_str() {
@@ -725,6 +839,13 @@ fn validate_logistic_artifact(artifact: &WalletMlModelArtifact) -> anyhow::Resul
             "TRON wallet ML model artifact has {} features but {} coefficients",
             artifact.feature_names.len(),
             artifact.coefficients.len()
+        ));
+    }
+    if !artifact.intercept.unwrap_or_default().is_finite()
+        || artifact.coefficients.iter().any(|value| !value.is_finite())
+    {
+        return Err(anyhow!(
+            "TRON wallet logistic model artifact has non-finite parameters"
         ));
     }
 
@@ -760,6 +881,12 @@ fn validate_mlp_artifact(artifact: &WalletMlModelArtifact) -> anyhow::Result<()>
                     row.len()
                 ));
             }
+            if row.iter().any(|value| !value.is_finite()) {
+                return Err(anyhow!("MLP layer {index} has non-finite weights"));
+            }
+        }
+        if layer.bias.iter().any(|value| !value.is_finite()) {
+            return Err(anyhow!("MLP layer {index} has non-finite bias values"));
         }
 
         validate_activation(layer.activation.as_deref().unwrap_or("relu"))?;
@@ -772,6 +899,14 @@ fn validate_mlp_artifact(artifact: &WalletMlModelArtifact) -> anyhow::Result<()>
             expected_input_width,
             artifact.output_weights.len()
         ));
+    }
+    if artifact
+        .output_weights
+        .iter()
+        .any(|value| !value.is_finite())
+        || !artifact.output_bias.is_finite()
+    {
+        return Err(anyhow!("MLP output layer has non-finite parameters"));
     }
 
     Ok(())
@@ -979,6 +1114,41 @@ fn calibrated_probability(raw_logit: f32, artifact: &WalletMlModelArtifact) -> f
         }
         _ => sigmoid(raw_logit),
     }
+}
+
+fn prediction_confidence(
+    probability: f32,
+    model_quality_score: f32,
+    snapshot: &WalletFeatureSnapshot,
+    artifact: &WalletMlModelArtifact,
+) -> f32 {
+    let margin = ((probability - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+    let data_support = (snapshot.features.data_volume_score
+        * (1.0 - snapshot.features.truncated_sample_score * 0.5))
+        .clamp(0.05, 1.0);
+    let max_standardized_distance = artifact
+        .feature_names
+        .iter()
+        .enumerate()
+        .filter_map(|(index, feature)| {
+            snapshot
+                .features
+                .value(feature)
+                .map(|value| model_feature_value(value, artifact, index).abs())
+        })
+        .fold(0.0_f32, f32::max);
+    let distribution_support = if max_standardized_distance <= 3.0 {
+        1.0
+    } else {
+        (1.0 / (1.0 + max_standardized_distance - 3.0)).clamp(0.1, 1.0)
+    };
+
+    clamp01(
+        model_quality_score.clamp(0.0, 1.0)
+            * data_support.sqrt()
+            * (0.35 + 0.65 * margin)
+            * distribution_support,
+    )
 }
 
 fn sigmoid(value: f32) -> f32 {
@@ -1225,6 +1395,7 @@ mod tests {
             feature_schema_version: FEATURE_SCHEMA_VERSION.to_string(),
             calibration_version: "calibration_v1".to_string(),
             artifact_json: artifact.to_string(),
+            artifact_sha256: String::new(),
             metrics_json: "{}".to_string(),
             model_quality_score: 0.82,
             trained_at_unix_ms: 1,
@@ -1265,6 +1436,7 @@ mod tests {
             feature_schema_version: FEATURE_SCHEMA_VERSION.to_string(),
             calibration_version: "calibration_v1".to_string(),
             artifact_json: artifact.to_string(),
+            artifact_sha256: String::new(),
             metrics_json: "{}".to_string(),
             model_quality_score: 0.82,
             trained_at_unix_ms: 1,
@@ -1331,5 +1503,16 @@ mod tests {
             .expect_err("invalid artifact should fail");
 
         assert!(format!("{err:#}").contains("features but"));
+    }
+
+    #[test]
+    fn registered_artifact_checksum_is_enforced() {
+        let mut model = mlp_model();
+        model.artifact_sha256 = "not-the-artifact-checksum".to_string();
+
+        let err = infer_wallet_ai_risk_with_model(snapshot(features()), &model)
+            .expect_err("checksum mismatch must fail inference");
+
+        assert!(format!("{err:#}").contains("checksum mismatch"));
     }
 }

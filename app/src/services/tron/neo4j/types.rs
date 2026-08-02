@@ -9,6 +9,8 @@ pub struct FlowNode {
     pub entity_type: Option<String>,
     pub exchange_name: Option<String>,
     pub exchange_role: Option<String>,
+    pub cluster_id: Option<String>,
+    pub cluster_role: Option<String>,
     pub confidence: Option<f32>,
 }
 
@@ -29,7 +31,6 @@ pub struct FlowEdge {
     pub exchange_flow_type: Option<String>,
     pub exchange_name: Option<String>,
     pub exchange_confidence: Option<f32>,
-    pub risk_score: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]

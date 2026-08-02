@@ -75,6 +75,7 @@ mod tests {
             from: from.to_string(),
             to: to.to_string(),
             amount,
+            raw_amount: amount.into(),
         }
     }
 

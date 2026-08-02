@@ -4,10 +4,10 @@ use clickhouse::Client;
 use serde::Serialize;
 
 use crate::services::tron::{
-    neo4j::{client::Neo4jClient, flow_graph::build_wallet_flow_graph, types::WalletFlowGraph},
-    wallet_ai_risk::{
-        WalletAiRiskAssessment, build_and_persist_wallet_ai_risk, build_disabled_wallet_ai_risk,
-    },
+    entity_intelligence::{WalletIntelligence, load_wallet_intelligence},
+    neo4j::{flow_graph::build_wallet_flow_graph, types::WalletFlowGraph},
+    wallet_activity::{WalletActivity, build_wallet_activity},
+    wallet_ai_risk::{WalletAiRiskAssessment, build_disabled_wallet_ai_risk},
     wallet_exposure::load_wallet_exposure_summary,
     wallet_fingerprint::{WalletFingerprint, build_wallet_fingerprint},
     wallet_holdings::{WalletHoldings, build_wallet_holdings},
@@ -21,7 +21,6 @@ pub struct WalletInvestigationOptions {
     pub top_counterparties: Option<usize>,
     pub max_events: Option<u64>,
     pub holdings_limit: Option<u64>,
-    pub ai_risk_enabled: bool,
 }
 
 impl WalletInvestigationOptions {
@@ -32,7 +31,6 @@ impl WalletInvestigationOptions {
         top_counterparties: Option<usize>,
         max_events: Option<u64>,
         holdings_limit: Option<u64>,
-        ai_risk_enabled: bool,
     ) -> Self {
         Self {
             graph_depth: graph_depth.unwrap_or(3).clamp(1, 6),
@@ -41,7 +39,6 @@ impl WalletInvestigationOptions {
             top_counterparties,
             max_events,
             holdings_limit,
-            ai_risk_enabled,
         }
     }
 }
@@ -52,6 +49,8 @@ pub struct WalletInvestigation {
     pub graph: WalletFlowGraph,
     pub holdings: WalletHoldings,
     pub fingerprint: WalletFingerprint,
+    pub activity: WalletActivity,
+    pub intelligence: WalletIntelligence,
     pub ai_risk: WalletAiRiskAssessment,
     pub data_quality: InvestigationDataQuality,
 }
@@ -67,46 +66,42 @@ pub struct InvestigationDataQuality {
     pub fingerprint_event_limit: u64,
     pub fingerprint_is_truncated: bool,
     pub observed_transfers: u64,
+    pub semantic_event_count: u64,
     pub warnings: Vec<String>,
 }
 
 pub async fn build_wallet_investigation(
     clickhouse: Arc<Client>,
-    neo4j: &Neo4jClient,
     address: &str,
     options: WalletInvestigationOptions,
 ) -> anyhow::Result<WalletInvestigation> {
-    let graph = build_wallet_flow_graph(
-        clickhouse.clone(),
-        neo4j,
-        address,
-        options.graph_depth,
-        options.graph_edge_limit,
-    )
-    .await?;
-
-    let holdings =
-        build_wallet_holdings(clickhouse.clone(), address, options.holdings_limit).await?;
-
-    let fingerprint = build_wallet_fingerprint(
-        clickhouse.clone(),
-        address,
-        options.window_days,
-        options.top_counterparties,
-        options.max_events,
-    )
-    .await?;
-
-    let exposure = load_wallet_exposure_summary(clickhouse.clone(), address, Some(25)).await?;
-    let ai_risk = if options.ai_risk_enabled {
-        build_and_persist_wallet_ai_risk(clickhouse, &fingerprint, exposure).await?
-    } else {
-        build_disabled_wallet_ai_risk(&fingerprint, exposure)
-    };
+    let (graph, holdings, fingerprint, activity, intelligence, exposure) = tokio::try_join!(
+        build_wallet_flow_graph(
+            clickhouse.clone(),
+            None,
+            address,
+            options.graph_depth,
+            options.graph_edge_limit,
+        ),
+        build_wallet_holdings(clickhouse.clone(), address, options.holdings_limit),
+        build_wallet_fingerprint(
+            clickhouse.clone(),
+            address,
+            options.window_days,
+            options.top_counterparties,
+            options.max_events,
+        ),
+        build_wallet_activity(clickhouse.clone(), address, options.window_days, Some(100)),
+        load_wallet_intelligence(clickhouse.clone(), address),
+        load_wallet_exposure_summary(clickhouse.clone(), address, Some(25)),
+    )?;
+    let ai_risk = build_disabled_wallet_ai_risk(&fingerprint, exposure);
     let data_quality = build_data_quality(
         &graph,
         &holdings,
         &fingerprint,
+        &activity,
+        &intelligence,
         options.graph_depth,
         options.graph_edge_limit,
     );
@@ -116,6 +111,8 @@ pub async fn build_wallet_investigation(
         graph,
         holdings,
         fingerprint,
+        activity,
+        intelligence,
         ai_risk,
         data_quality,
     })
@@ -125,6 +122,8 @@ fn build_data_quality(
     graph: &WalletFlowGraph,
     holdings: &WalletHoldings,
     fingerprint: &WalletFingerprint,
+    activity: &WalletActivity,
+    intelligence: &WalletIntelligence,
     graph_depth: u8,
     graph_edge_limit: u64,
 ) -> InvestigationDataQuality {
@@ -151,9 +150,15 @@ fn build_data_quality(
     if holdings.metadata_gap_count > 0 {
         warnings.push("token_metadata_gaps_in_holdings".to_string());
     }
+    if holdings.incomplete_balance_count > 0 {
+        warnings.push("incomplete_balance_history".to_string());
+    }
 
     if graph_depth >= 6 {
         warnings.push("graph_depth_capped".to_string());
+    }
+    if intelligence.pending_review_count > 0 {
+        warnings.push("identity_claims_pending_review".to_string());
     }
 
     InvestigationDataQuality {
@@ -166,6 +171,7 @@ fn build_data_quality(
         fingerprint_event_limit: fingerprint.sampled_event_limit,
         fingerprint_is_truncated: fingerprint.is_truncated,
         observed_transfers: fingerprint.flows.total_transfers,
+        semantic_event_count: activity.summary.semantic_event_count,
         warnings,
     }
 }

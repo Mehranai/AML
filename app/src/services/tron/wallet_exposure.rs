@@ -33,6 +33,9 @@ pub struct WalletExposureSource {
     pub last_tx_hash: String,
     pub last_seen_block: u64,
     pub exposure_type: String,
+    pub best_path_amount_share: f32,
+    pub best_path_time_weight: f32,
+    pub service_mediated: bool,
 }
 
 #[derive(Debug, Deserialize, clickhouse::Row)]
@@ -48,6 +51,9 @@ struct WalletExposureQueryRow {
     last_tx_hash: String,
     last_seen_block: u64,
     exposure_type: String,
+    best_path_amount_share: f64,
+    best_path_time_weight: f64,
+    service_mediated: u8,
 }
 
 impl WalletExposureSummary {
@@ -89,6 +95,9 @@ impl WalletExposureSummary {
                     last_tx_hash: row.last_tx_hash,
                     last_seen_block: row.last_seen_block,
                     exposure_type: row.exposure_type,
+                    best_path_amount_share: row.best_path_amount_share as f32,
+                    best_path_time_weight: row.best_path_time_weight as f32,
+                    service_mediated: row.service_mediated == 1,
                 }
             })
             .collect::<Vec<_>>();
@@ -108,20 +117,12 @@ impl WalletExposureSummary {
             .iter()
             .map(|source| source.exposure_score)
             .fold(0.0_f32, f32::max);
-        let max_effective_score = top_sources
-            .iter()
-            .map(|source| source.effective_score)
-            .fold(0.0_f32, f32::max);
-
-        let source_bonus = ((source_count as f32) / 5.0).min(1.0) * 0.08;
-        let path_bonus = ((path_count as f32).log10().max(0.0) / 3.0).min(1.0) * 0.07;
-        let hop_bonus = match min_hop_distance {
-            Some(1) => 0.10,
-            Some(2) => 0.06,
-            Some(3) => 0.03,
-            _ => 0.0,
-        };
-        let score = clamp01(max_effective_score * 0.75 + source_bonus + path_bonus + hop_bonus);
+        let score = clamp01(
+            1.0 - top_sources
+                .iter()
+                .map(|source| 1.0 - source.effective_score.clamp(0.0, 0.99))
+                .product::<f32>(),
+        );
 
         let mut evidence = vec![
             format!("propagated_exposure_sources={source_count}"),
@@ -178,18 +179,29 @@ pub async fn load_wallet_exposure_summary(
                 sum(ae.path_count) AS path_count,
                 argMax(ae.last_tx_hash, ae.last_seen_block) AS last_tx_hash,
                 max(ae.last_seen_block) AS last_seen_block,
-                anyLast(ae.exposure_type) AS exposure_type
-            FROM address_exposure AS ae
-            LEFT JOIN
+                argMax(ae.exposure_type, ae.exposure_score) AS exposure_type,
+                argMax(ae.best_path_amount_share, ae.exposure_score) AS best_path_amount_share,
+                argMax(ae.best_path_time_weight, ae.exposure_score) AS best_path_time_weight,
+                argMax(ae.service_mediated, ae.exposure_score) AS service_mediated
+            FROM
+            (
+                SELECT *
+                FROM address_exposure FINAL
+            ) AS ae
+            INNER JOIN exposure_runs AS exposure_run FINAL
+                ON exposure_run.source_address = ae.source_address
+               AND exposure_run.propagation_run_id = ae.propagation_run_id
+               AND exposure_run.status = 'COMPLETE'
+            INNER JOIN
             (
                 SELECT
                     address,
-                    argMax(entity_name, created_at) AS entity_name,
-                    argMax(entity_type, created_at) AS entity_type,
-                    max(risk_level) AS risk_level,
-                    argMax(source, created_at) AS source
-                FROM exposure_seeds
-                GROUP BY address
+                    entity_name,
+                    entity_type,
+                    risk_level,
+                    source
+                FROM exposure_seeds FINAL
+                WHERE risk_level > 0
             ) AS seed
                 ON seed.address = ae.source_address
             WHERE ae.exposed_address = ?
@@ -208,14 +220,7 @@ pub async fn load_wallet_exposure_summary(
 }
 
 fn normalize_seed_risk_level(risk_level: u8) -> f32 {
-    let normalized = match risk_level {
-        0 => 0.0,
-        1..=4 => f32::from(risk_level) / 4.0,
-        5..=10 => f32::from(risk_level) / 10.0,
-        _ => f32::from(risk_level) / 100.0,
-    };
-
-    clamp01(normalized)
+    clamp01(f32::from(risk_level) / 100.0)
 }
 
 fn non_empty(value: String) -> Option<String> {

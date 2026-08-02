@@ -5,9 +5,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::config::AppConfig;
-use crate::handlers::tron_common::{
-    TronApiError, clickhouse_client, neo4j_client, normalize_wallet_address,
-};
+use crate::handlers::tron_common::{TronApiError, clickhouse_client, normalize_wallet_address};
 use crate::services::tron::wallet_investigation::{
     WalletInvestigation, WalletInvestigationOptions, build_wallet_investigation,
 };
@@ -29,7 +27,6 @@ pub async fn tron_wallet_investigation(
     let config = AppConfig::from_env();
     let address = normalize_wallet_address(&address)?;
     let clickhouse = clickhouse_client(&config);
-    let neo4j = neo4j_client(&config).await?;
     let options = WalletInvestigationOptions::new(
         params.depth,
         params.limit,
@@ -37,10 +34,9 @@ pub async fn tron_wallet_investigation(
         params.top_counterparties,
         params.max_events,
         params.holdings_limit,
-        config.tron_ai_risk_enabled,
     );
 
-    let investigation = build_wallet_investigation(clickhouse, &neo4j, &address, options)
+    let investigation = build_wallet_investigation(clickhouse, &address, options)
         .await
         .map_err(TronApiError::internal)?;
 

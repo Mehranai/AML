@@ -13,6 +13,7 @@ pub struct WalletHoldings {
     pub native_balance: Option<WalletAssetHolding>,
     pub assets: Vec<WalletAssetHolding>,
     pub metadata_gap_count: usize,
+    pub incomplete_balance_count: usize,
     pub source: String,
     pub generated_at_unix_ms: u64,
 }
@@ -26,6 +27,7 @@ pub struct WalletAssetHolding {
     pub decimals: u8,
     pub balance_raw: String,
     pub balance_decimal: f64,
+    pub balance_incomplete: bool,
     pub metadata_available: bool,
 }
 
@@ -38,6 +40,7 @@ struct WalletAssetHoldingRow {
     decimals: u8,
     balance_raw: String,
     balance_decimal: f64,
+    balance_incomplete: u8,
     metadata_available: u8,
 }
 
@@ -72,6 +75,7 @@ pub async fn build_wallet_holdings(
                 decimals,
                 toString(balance_raw) AS balance_raw,
                 balance_decimal,
+                balance_incomplete,
                 if(
                     asset_type = 'native'
                     OR asset_name != ''
@@ -103,6 +107,7 @@ pub async fn build_wallet_holdings(
             decimals: row.decimals,
             balance_raw: row.balance_raw,
             balance_decimal: row.balance_decimal,
+            balance_incomplete: row.balance_incomplete == 1,
             metadata_available: row.metadata_available == 1,
         })
         .collect::<Vec<_>>();
@@ -115,6 +120,10 @@ pub async fn build_wallet_holdings(
         .iter()
         .filter(|asset| asset.asset_type != "native" && !asset.metadata_available)
         .count();
+    let incomplete_balance_count = assets
+        .iter()
+        .filter(|asset| asset.balance_incomplete)
+        .count();
 
     Ok(WalletHoldings {
         address: address.to_string(),
@@ -124,6 +133,7 @@ pub async fn build_wallet_holdings(
         native_balance,
         assets,
         metadata_gap_count,
+        incomplete_balance_count,
         source: "wallet_asset_balances".to_string(),
         generated_at_unix_ms,
     })

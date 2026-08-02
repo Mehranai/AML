@@ -3,6 +3,13 @@ target/
 **/target/
 **/*.rs.bk
 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+**/.env
+
 # Docker Data
 **/reth-data/
 **/bitcoin-data/

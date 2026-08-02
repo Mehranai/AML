@@ -18,11 +18,11 @@ CREATE TABLE IF NOT EXISTS tron_db.transactions
     contract_address String DEFAULT '',
     contract_type String,
 
-    amount UInt128,
+    amount UInt256,
 
-    fee UInt128 DEFAULT 0,
-    energy_fee UInt128 DEFAULT 0,
-    net_fee UInt128 DEFAULT 0,
+    fee UInt256 DEFAULT 0,
+    energy_fee UInt256 DEFAULT 0,
+    net_fee UInt256 DEFAULT 0,
 
     energy_usage UInt64 DEFAULT 0,
     energy_usage_total UInt64 DEFAULT 0,
@@ -35,9 +35,9 @@ CREATE TABLE IF NOT EXISTS tron_db.transactions
 
     inserted_at DateTime DEFAULT now()
 )
-    ENGINE = MergeTree()
+    ENGINE = ReplacingMergeTree(inserted_at)
     PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000)))
-    ORDER BY (block_number, tx_hash)
+    ORDER BY tx_hash
     SETTINGS index_granularity = 8192;
 
 -- =========================================================
@@ -63,10 +63,9 @@ CREATE TABLE IF NOT EXISTS tron_db.raw_logs
 
     inserted_at DateTime DEFAULT now()
     )
-    ENGINE = MergeTree()
+    ENGINE = ReplacingMergeTree(inserted_at)
     PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000)))
     ORDER BY (
-                 block_number,
                  tx_hash,
                  log_index
              );
@@ -114,7 +113,7 @@ CREATE TABLE IF NOT EXISTS tron_db.token_transfers
     from_address String,
     to_address String,
 
-    amount UInt128,
+    amount UInt256,
 
     is_mint UInt8 DEFAULT 0,
     is_burn UInt8 DEFAULT 0,
@@ -123,13 +122,9 @@ CREATE TABLE IF NOT EXISTS tron_db.token_transfers
 
     inserted_at DateTime DEFAULT now()
     )
-    ENGINE = MergeTree()
+    ENGINE = ReplacingMergeTree(inserted_at)
     PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000)))
     ORDER BY (
-                 token_address,
-                 from_address,
-                 to_address,
-                 block_number,
                  tx_hash,
                  log_index
              );
@@ -154,7 +149,7 @@ CREATE TABLE IF NOT EXISTS tron_db.address_relationships
 
     timestamp UInt64,
 
-    amount UInt128,
+    amount UInt256,
 
     transfer_type String,
 
@@ -162,19 +157,13 @@ CREATE TABLE IF NOT EXISTS tron_db.address_relationships
 
     event_type String DEFAULT '',
 
-    risk_score UInt8 DEFAULT 0,
-
     hop_count UInt16 DEFAULT 0,
 
     inserted_at DateTime DEFAULT now()
     )
-    ENGINE = MergeTree()
+    ENGINE = ReplacingMergeTree(inserted_at)
     PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000)))
-    ORDER BY (
-                 from_address,
-                 timestamp,
-                 tx_hash
-             );
+    ORDER BY relationship_id;
 
 -- =========================================================
 -- ADDRESS ENTITY
@@ -194,29 +183,12 @@ CREATE TABLE IF NOT EXISTS tron_db.address_entity
 
     source String,
 
-    created_at DateTime DEFAULT now()
+    is_active UInt8 DEFAULT 1,
+
+    created_at DateTime64(3) DEFAULT now64(3)
     )
     ENGINE = ReplacingMergeTree(created_at)
     ORDER BY address;
-
--- =========================================================
--- EXCHANGE ENTITIES
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.exchange_entities
-(
-    entity_id String,
-
-    exchange_name String,
-
-    exchange_type String,
-
-    confidence Float32,
-
-    created_at DateTime DEFAULT now()
-    )
-    ENGINE = ReplacingMergeTree(created_at)
-    ORDER BY entity_id;
 
 -- =========================================================
 -- EXCHANGE ADDRESSES
@@ -239,60 +211,12 @@ CREATE TABLE IF NOT EXISTS tron_db.exchange_addresses
     first_seen_block UInt64,
     last_seen_block UInt64,
 
-    created_at DateTime DEFAULT now()
-    )
-    ENGINE = ReplacingMergeTree(created_at)
-    ORDER BY address;
-
--- =========================================================
--- EXCHANGE DEPOSIT ADDRESSES
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.exchange_deposit_addresses
-(
-    address String,
-
-    exchange_name String,
-
-    hot_wallet String,
-
-    confidence Float32,
-
-    detection_method String,
-
-    first_seen_block UInt64,
-    last_seen_block UInt64,
-
-    inserted_at DateTime DEFAULT now()
-    )
-    ENGINE = ReplacingMergeTree(inserted_at)
-    ORDER BY address;
-
--- =========================================================
--- EXCHANGE CLUSTERS
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.exchange_clusters
-(
-    cluster_id String,
-
-    exchange_name String,
-
-    address String,
-
-    role String,
-
-    confidence Float32,
-
-    discovered_from String,
+    is_active UInt8 DEFAULT 1,
 
     created_at DateTime DEFAULT now()
     )
     ENGINE = ReplacingMergeTree(created_at)
-    ORDER BY (
-                 cluster_id,
-                 address
-             );
+    ORDER BY address;
 
 -- =========================================================
 -- EXCHANGE FLOWS
@@ -314,7 +238,7 @@ CREATE TABLE IF NOT EXISTS tron_db.exchange_flows
 
     token_address String,
 
-    amount UInt128,
+    amount UInt256,
 
     confidence Float32,
 
@@ -407,190 +331,6 @@ CREATE TABLE IF NOT EXISTS tron_db.transaction_features
              );
 
 -- =========================================================
--- TRANSACTION RISK
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.transaction_risk
-(
-    tx_hash String,
-    block_number UInt64,
-
-    timestamp UInt64,
-
-    risk_score UInt8,
-    risk_level String,
-
-    transaction_type String DEFAULT 'unknown',
-
-    transaction_subtype String DEFAULT '',
-
-    is_swap UInt8,
-    is_bridge UInt8,
-    is_contract_call UInt8,
-
-    unique_tokens UInt16,
-
-    participants UInt16,
-    risk_reasons Array(String) DEFAULT [],
-
-    touches_exchange UInt8 DEFAULT 0,
-
-    inserted_at DateTime DEFAULT now()
-    )
-    ENGINE = ReplacingMergeTree(inserted_at)
-    PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000)))
-    ORDER BY (
-                 risk_score,
-                 block_number
-             );
-
--- =========================================================
--- WALLET ASSET BALANCES
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.wallet_asset_balance_deltas
-(
-    tx_hash String,
-
-    block_number UInt64,
-
-    timestamp UInt64,
-
-    address String,
-
-    asset_type String,
-
-    asset_id String,
-
-    delta_raw Int256,
-
-    direction Int8,
-
-    inserted_at DateTime DEFAULT now()
-)
-    ENGINE = MergeTree()
-    PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000)))
-    ORDER BY (
-                 address,
-                 asset_type,
-                 asset_id,
-                 block_number,
-                 tx_hash
-             );
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS tron_db.mv_wallet_asset_delta_trx_from
-TO tron_db.wallet_asset_balance_deltas
-AS
-SELECT
-    tx_hash,
-    block_number,
-    timestamp,
-    from_address AS address,
-    'native' AS asset_type,
-    'TRX' AS asset_id,
-    -toInt256(amount) AS delta_raw,
-    -1 AS direction,
-    now() AS inserted_at
-FROM tron_db.transactions
-WHERE from_address != ''
-  AND amount > 0;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS tron_db.mv_wallet_asset_delta_trx_to
-TO tron_db.wallet_asset_balance_deltas
-AS
-SELECT
-    tx_hash,
-    block_number,
-    timestamp,
-    to_address AS address,
-    'native' AS asset_type,
-    'TRX' AS asset_id,
-    toInt256(amount) AS delta_raw,
-    1 AS direction,
-    now() AS inserted_at
-FROM tron_db.transactions
-WHERE to_address != ''
-  AND amount > 0;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS tron_db.mv_wallet_asset_delta_token_from
-TO tron_db.wallet_asset_balance_deltas
-AS
-SELECT
-    tx_hash,
-    block_number,
-    timestamp,
-    from_address AS address,
-    'trc20' AS asset_type,
-    token_address AS asset_id,
-    -toInt256(amount) AS delta_raw,
-    -1 AS direction,
-    now() AS inserted_at
-FROM tron_db.token_transfers
-WHERE from_address != 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb'
-  AND amount > 0;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS tron_db.mv_wallet_asset_delta_token_to
-TO tron_db.wallet_asset_balance_deltas
-AS
-SELECT
-    tx_hash,
-    block_number,
-    timestamp,
-    to_address AS address,
-    'trc20' AS asset_type,
-    token_address AS asset_id,
-    toInt256(amount) AS delta_raw,
-    1 AS direction,
-    now() AS inserted_at
-FROM tron_db.token_transfers
-WHERE to_address != 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb'
-  AND amount > 0;
-
-CREATE VIEW IF NOT EXISTS tron_db.wallet_asset_balances AS
-SELECT
-    balances.address,
-    balances.asset_type,
-    balances.asset_id,
-    if(
-        balances.asset_type = 'native',
-        'TRX',
-        if(token_metadata.symbol = '', balances.asset_id, token_metadata.symbol)
-    ) AS asset_symbol,
-    if(
-        balances.asset_type = 'native',
-        'TRON',
-        token_metadata.name
-    ) AS asset_name,
-    if(
-        balances.asset_type = 'native',
-        toUInt8(6),
-        token_metadata.decimals
-    ) AS decimals,
-    balances.balance_raw,
-    if(
-        if(balances.asset_type = 'native', toUInt8(6), token_metadata.decimals) = 0,
-        0,
-        toFloat64(balances.balance_raw) / pow(10, if(balances.asset_type = 'native', toUInt8(6), token_metadata.decimals))
-    ) AS balance_decimal
-FROM
-(
-    SELECT
-        address,
-        asset_type,
-        asset_id,
-        if(sum(delta_raw) < 0, toInt256(0), sum(delta_raw)) AS balance_raw
-    FROM tron_db.wallet_asset_balance_deltas
-    GROUP BY
-        address,
-        asset_type,
-        asset_id
-    HAVING balance_raw > 0
-) AS balances
-LEFT JOIN tron_db.token_metadata AS token_metadata
-    ON balances.asset_type = 'trc20'
-   AND balances.asset_id = token_metadata.token_address;
-
--- =========================================================
 -- EXPOSURE SEEDS
 -- =========================================================
 
@@ -606,7 +346,7 @@ CREATE TABLE IF NOT EXISTS tron_db.exposure_seeds
 
     source String,
 
-    created_at DateTime DEFAULT now()
+    created_at DateTime64(3) DEFAULT now64(3)
     )
     ENGINE = ReplacingMergeTree(created_at)
     ORDER BY address;
@@ -626,6 +366,11 @@ CREATE TABLE IF NOT EXISTS tron_db.address_exposure
     last_seen_block UInt64,
     exposure_type String,
     direction String,
+    best_path_amount_share Float64 DEFAULT 0,
+    best_path_time_weight Float64 DEFAULT 0,
+    service_mediated UInt8 DEFAULT 0,
+    propagation_run_id String DEFAULT '',
+    computed_at_unix_ms UInt64 DEFAULT 0,
 
     updated_at DateTime DEFAULT now()
     )
@@ -635,67 +380,18 @@ CREATE TABLE IF NOT EXISTS tron_db.address_exposure
                  exposed_address
              );
 
--- =========================================================
--- ADDRESS PROFILES
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.address_profiles
+CREATE TABLE IF NOT EXISTS tron_db.exposure_runs
 (
-    address String,
-
-    total_in_tx UInt64,
-    total_out_tx UInt64,
-
-    unique_senders UInt64,
-    unique_receivers UInt64,
-
-    total_volume_in UInt128,
-    total_volume_out UInt128,
-
-    interacted_tokens UInt32,
-
-    probable_exchange UInt8,
-    probable_deposit_wallet UInt8,
-    probable_sweeper UInt8,
-
-    risk_score Float32,
-
-    updated_at DateTime DEFAULT now()
-    )
+    source_address String,
+    propagation_run_id String,
+    status String,
+    max_hops UInt8,
+    row_count UInt64,
+    completed_at_unix_ms UInt64,
+    updated_at DateTime64(3) DEFAULT now64(3)
+)
     ENGINE = ReplacingMergeTree(updated_at)
-    ORDER BY address;
-
--- =========================================================
--- ADDRESS COUNTERPARTIES
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS tron_db.address_counterparties
-(
-    address String,
-
-    counterparty String,
-
-    direction String,
-
-    token_address String,
-
-    total_txs UInt64,
-
-    total_volume UInt128,
-
-    first_seen UInt64,
-
-    last_seen UInt64,
-
-    updated_at DateTime DEFAULT now()
-    )
-    ENGINE = ReplacingMergeTree(updated_at)
-    ORDER BY (
-                 address,
-                 counterparty,
-                 direction,
-                 token_address
-             );
+    ORDER BY source_address;
 
 -- =========================================================
 -- SYNC STATE
@@ -744,17 +440,6 @@ ALTER TABLE tron_db.transaction_features
     TYPE set(100)
     GRANULARITY 4;
 
-ALTER TABLE tron_db.transaction_risk
-    ADD INDEX IF NOT EXISTS idx_risk (risk_score)
-    TYPE minmax
-    GRANULARITY 4;
-
-ALTER TABLE tron_db.transaction_risk
-    ADD COLUMN IF NOT EXISTS transaction_type String DEFAULT 'unknown';
-
-ALTER TABLE tron_db.transaction_risk
-    ADD COLUMN IF NOT EXISTS transaction_subtype String DEFAULT '';
-
 ALTER TABLE tron_db.address_relationships
     ADD INDEX IF NOT EXISTS idx_transfer_type (transfer_type)
     TYPE set(100)
@@ -778,9 +463,4 @@ ALTER TABLE tron_db.transactions
 ALTER TABLE tron_db.token_transfers
     ADD INDEX IF NOT EXISTS idx_token token_address TYPE bloom_filter GRANULARITY 4;
 
-ALTER TABLE tron_db.address_relationships
-    ADD INDEX IF NOT EXISTS idx_from from_address TYPE bloom_filter GRANULARITY 4;
-
-ALTER TABLE tron_db.address_relationships
-    ADD INDEX IF NOT EXISTS idx_to to_address TYPE bloom_filter GRANULARITY 4;
 -- added More

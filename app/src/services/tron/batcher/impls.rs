@@ -1,9 +1,8 @@
 use crate::models::tron::exchange::ExchangeFlowRow;
 use crate::models::tron::modules::{
-    TransactionFeatureRow, TransactionRiskRow, TransactionRow, TronRawLogRow, TronTokenTransferRow,
+    SemanticAmlEventRow, TokenMetadataDiscoveryRow, TransactionFeatureRow, TransactionRow,
 };
 use crate::models::tron::relationship::AddressRelationshipRow;
-use crate::progress::progress_tron::ContractMetadataRow;
 
 use super::traits::BatchInsert;
 
@@ -15,16 +14,8 @@ impl BatchInsert for TransactionRow {
     }
 }
 
-impl BatchInsert for TronTokenTransferRow {
-    const TABLE: &'static str = "token_transfers";
-
-    fn as_value(&self) -> Self::Value<'_> {
-        self.clone()
-    }
-}
-
-impl BatchInsert for TronRawLogRow {
-    const TABLE: &'static str = "raw_logs";
+impl BatchInsert for TokenMetadataDiscoveryRow {
+    const TABLE: &'static str = "token_metadata_discoveries";
 
     fn as_value(&self) -> Self::Value<'_> {
         self.clone()
@@ -39,6 +30,14 @@ impl BatchInsert for AddressRelationshipRow {
     }
 }
 
+impl BatchInsert for SemanticAmlEventRow {
+    const TABLE: &'static str = "semantic_aml_events";
+
+    fn as_value(&self) -> Self::Value<'_> {
+        self.clone()
+    }
+}
+
 impl BatchInsert for TransactionFeatureRow {
     const TABLE: &'static str = "transaction_features";
 
@@ -47,24 +46,8 @@ impl BatchInsert for TransactionFeatureRow {
     }
 }
 
-impl BatchInsert for TransactionRiskRow {
-    const TABLE: &'static str = "transaction_risk";
-
-    fn as_value(&self) -> Self::Value<'_> {
-        self.clone()
-    }
-}
-
-impl BatchInsert for ContractMetadataRow {
-    const TABLE: &'static str = "contract_metadata";
-
-    fn as_value(&self) -> Self::Value<'_> {
-        self.clone()
-    }
-}
-
 impl BatchInsert for ExchangeFlowRow {
-    const TABLE: &'static str = "exchange_flows";
+    const TABLE: &'static str = "exchange_flows_v2";
 
     fn as_value(&self) -> Self::Value<'_> {
         self.clone()

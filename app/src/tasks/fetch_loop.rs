@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clickhouse::Client;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SyncMode};
 
 use crate::services::{
     bitcoin, bsc, ethereum,
@@ -17,6 +19,7 @@ use crate::db::init_eth::init_eth_db;
 use crate::db::init_tron::init_tron_db;
 
 use crate::db::sync_state::get_last_synced_block;
+use crate::services::tron::ingestion_state::FinalizedHashConflict;
 
 pub async fn run_btc_loop(config: AppConfig) -> Result<()> {
     println!("===============================");
@@ -175,8 +178,41 @@ pub async fn run_tron_loop(config: AppConfig) -> Result<()> {
         config.sync_mode, start_block, last_synced
     );
 
-    tron::fetcher::fetch_tron(loader.clone(), start_block, config.total_tron_txs).await?;
+    if matches!(config.sync_mode, SyncMode::Backfill) {
+        tron::fetcher::fetch_tron(loader, start_block, config.total_tron_txs).await?;
+        println!("[TRON] Backfill pass finished successfully.");
+        return Ok(());
+    }
 
-    println!("[TRON] Finished successfully.");
-    Ok(())
+    let mut next_block = start_block;
+    let mut retry_delay_seconds = 1_u64;
+    let poll_interval_seconds = config.tron_poll_interval_seconds.max(1);
+
+    loop {
+        match tron::fetcher::fetch_tron(loader.clone(), next_block, config.total_tron_txs).await {
+            Ok(()) => {
+                retry_delay_seconds = 1;
+                if let Some(last_synced) = get_last_synced_block(&loader.clickhouse, "tron").await?
+                {
+                    next_block = last_synced.saturating_add(1);
+                }
+                sleep(Duration::from_secs(poll_interval_seconds)).await;
+            }
+            Err(error) => {
+                if error.downcast_ref::<FinalizedHashConflict>().is_some() {
+                    eprintln!(
+                        "[TRON] ingestion stopped because finalized block evidence conflicts: {error:#}"
+                    );
+                    return Err(error);
+                }
+
+                eprintln!(
+                    "[TRON] ingestion pass failed at block {}: {error:#}; retrying in {} second(s)",
+                    next_block, retry_delay_seconds
+                );
+                sleep(Duration::from_secs(retry_delay_seconds)).await;
+                retry_delay_seconds = (retry_delay_seconds * 2).min(60);
+            }
+        }
+    }
 }

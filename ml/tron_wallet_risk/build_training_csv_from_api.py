@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -74,6 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 def read_labels(path: Path, limit: int) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
+    seen_addresses: dict[str, str] = {}
     with path.open("r", newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
@@ -88,6 +90,12 @@ def read_labels(path: Path, limit: int) -> list[dict[str, str]]:
             label = normalize_label(row.get("label") or "")
             if not address:
                 continue
+            normalized_address = address.lower()
+            if normalized_address in seen_addresses:
+                raise ValueError(
+                    f"duplicate wallet address {address!r}; one wallet must produce one training sample"
+                )
+            seen_addresses[normalized_address] = label
             rows.append({"address": address, "label": label})
             if limit and len(rows) >= limit:
                 break
@@ -117,7 +125,7 @@ def wallet_ai_risk_url(args: argparse.Namespace, address: str) -> str:
     encoded_address = urllib.parse.quote(address, safe="")
     return f"{args.api_base.rstrip('/')}/api/tron/wallet/{encoded_address}/ai-risk?{query}"
 
-def fetch_wallet_features(args: argparse.Namespace, address: str) -> dict[str, float]:
+def fetch_wallet_features(args: argparse.Namespace, address: str) -> dict[str, str | float | int]:
     url = wallet_ai_risk_url(args, address)
     last_error: Exception | None = None
 
@@ -126,10 +134,31 @@ def fetch_wallet_features(args: argparse.Namespace, address: str) -> dict[str, f
             request = urllib.request.Request(url, headers={"accept": "application/json"})
             with urllib.request.urlopen(request, timeout=args.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            features = payload.get("feature_snapshot", {}).get("features", {})
+            snapshot = payload.get("feature_snapshot", {})
+            features = snapshot.get("features", {})
             if not isinstance(features, dict):
                 raise ValueError("API response did not include feature_snapshot.features")
-            return {feature: float(features.get(feature, 0.0) or 0.0) for feature in FEATURE_NAMES}
+            missing = [feature for feature in FEATURE_NAMES if feature not in features]
+            if missing:
+                raise ValueError(f"API response is missing required features: {missing}")
+
+            result = {feature: float(features[feature]) for feature in FEATURE_NAMES}
+            non_finite = [
+                feature for feature, value in result.items() if not math.isfinite(value)
+            ]
+            if non_finite:
+                raise ValueError(f"API response contains non-finite features: {non_finite}")
+            snapshot_id = str(snapshot.get("snapshot_id") or "").strip()
+            schema_version = str(snapshot.get("feature_schema_version") or "").strip()
+            generated_at = int(snapshot.get("generated_at_unix_ms") or 0)
+            if not snapshot_id or not schema_version or generated_at <= 0:
+                raise ValueError("API response has incomplete feature snapshot provenance")
+            return {
+                "snapshot_id": snapshot_id,
+                "feature_schema_version": schema_version,
+                "feature_generated_at_unix_ms": generated_at,
+                **result,
+            }
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
             last_error = exc
             if attempt < args.retries:
@@ -199,7 +228,17 @@ def main() -> None:
     with output_path.open("w", newline="", encoding="utf-8") as output_handle, failed_path.open(
         "w", newline="", encoding="utf-8"
     ) as failed_handle:
-        writer = csv.DictWriter(output_handle, fieldnames=["address", "label", *FEATURE_NAMES])
+        writer = csv.DictWriter(
+            output_handle,
+            fieldnames=[
+                "address",
+                "label",
+                "snapshot_id",
+                "feature_schema_version",
+                "feature_generated_at_unix_ms",
+                *FEATURE_NAMES,
+            ],
+        )
         failed_writer = csv.DictWriter(failed_handle, fieldnames=["address", "label", "error"])
         writer.writeheader()
         failed_writer.writeheader()

@@ -1,7 +1,7 @@
 use crate::handlers::{
-    dashboard, eth_wallet_holdings, health, status, tron_graph, tron_wallet_ai_risk,
-    tron_wallet_analysis, tron_wallet_fingerprint, tron_wallet_holdings, tron_wallet_investigation,
-    tron_wallet_paths,
+    dashboard, eth_wallet_holdings, health, status, tron_graph, tron_ingestion_health,
+    tron_wallet_ai_risk, tron_wallet_analysis, tron_wallet_fingerprint, tron_wallet_holdings,
+    tron_wallet_investigation, tron_wallet_paths,
 };
 use axum::{
     Router,
@@ -12,7 +12,12 @@ pub fn build_router() -> Router {
     Router::new()
         .route("/", get(dashboard::dashboard))
         .route("/health", get(health::health_check))
+        .route("/ready", get(health::readiness_check))
         .route("/status", get(status::status))
+        .route(
+            "/tron/ingestion/health",
+            get(tron_ingestion_health::tron_ingestion_health),
+        )
         .route(
             "/eth/wallet/{address}/holdings",
             get(eth_wallet_holdings::eth_wallet_holdings),
@@ -43,15 +48,23 @@ pub fn build_router() -> Router {
         )
         .route(
             "/tron/wallet/{address}/neo4j/import",
-            post(tron_graph::tron_wallet_graph),
+            post(tron_graph::tron_wallet_graph_import),
         )
         .route(
             "/tron/wallet/{source}/paths/{target}",
             get(tron_wallet_paths::tron_wallet_paths),
         )
         .route(
+            "/tron/wallet/{source}/paths/{target}/neo4j/import",
+            post(tron_wallet_paths::tron_wallet_paths_import),
+        )
+        .route(
             "/api/tron/wallet/{address}/graph",
             get(tron_graph::tron_wallet_graph),
+        )
+        .route(
+            "/api/tron/ingestion/health",
+            get(tron_ingestion_health::tron_ingestion_health),
         )
         .route(
             "/api/eth/wallet/{address}/holdings",
@@ -79,10 +92,14 @@ pub fn build_router() -> Router {
         )
         .route(
             "/api/tron/wallet/{address}/neo4j/import",
-            post(tron_graph::tron_wallet_graph),
+            post(tron_graph::tron_wallet_graph_import),
         )
         .route(
             "/api/tron/wallet/{source}/paths/{target}",
             get(tron_wallet_paths::tron_wallet_paths),
+        )
+        .route(
+            "/api/tron/wallet/{source}/paths/{target}/neo4j/import",
+            post(tron_wallet_paths::tron_wallet_paths_import),
         )
 }

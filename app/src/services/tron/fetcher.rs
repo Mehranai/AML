@@ -3,25 +3,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
+use clickhouse::types::UInt256;
 use futures::stream::{self, StreamExt};
 use serde_json::Value;
 
-use crate::models::tron::modules::TransactionRiskRow;
 use crate::models::tron::modules::TransactionRow;
-use crate::models::tron::modules::TronRawLogRow;
-use crate::models::tron::modules::TronTokenTransferRow;
 
 use crate::progress::core::save_sync_state;
-
-use crate::progress::progress_tron::{
-    ContractMetadataRow, save_address_entity, save_exchange_address, save_exchange_cluster,
-    save_exchange_deposit_address, save_exchange_entity,
-};
 
 use crate::models::tron::modules::TransactionFeatureRow;
 
 use crate::services::loader::LoaderTron;
-use crate::utils::tron_address::normalize_tron_address;
+use crate::services::tron::ingestion_state::{
+    FinalizedHashConflict, record_failed_block, record_ingested_block, record_ingestion_failure,
+    record_processing_block, resolve_ingestion_failures, should_ingest_block,
+};
 
 // aml section
 use crate::services::tron::aml::bridge_detector::detect_bridges;
@@ -32,157 +28,24 @@ use crate::services::tron::aml::types::SimpleTransfer;
 use crate::services::tron::tron_classifier::classifier::classify;
 use crate::services::tron::tron_classifier::types::{ClassificationInput, ContractCategory};
 
-use crate::services::tron::risk_engine::compute_risk_score;
+use crate::services::tron::semantic_event_builder::build_semantic_event_rows;
 use crate::services::tron::transaction_type::{
     TransactionSemanticsInput, classify_transaction_semantics,
 };
-use crate::services::tron::tron_metadata_worker;
+use crate::services::tron::transfer_extractor::{
+    TransferKind, extract_contract_transfers, extract_internal_transfers, extract_trc20_transfers,
+    has_contract_call, primary_contract_summary, primary_method_data,
+};
+use chrono::Utc;
 
 use crate::services::tron::aml::mint_burn_detector::detect_mints_and_burns;
 use crate::services::tron::relationship_builder::build_relationships;
 
-// flow detection
-use crate::models::tron::exchange::{AddressEntityRow, ExchangeEntityRow};
 use crate::services::tron::exchange::detector::detect_exchange_attributions;
 use crate::services::tron::exchange::flow_builder::build_exchange_flows;
 
-// intelligence system
-use crate::models::tron::address_profile::AddressProfileRow;
-use crate::models::tron::counterparty::CounterpartyRow;
-use crate::progress::address_profile::save_address_profiles;
-use crate::progress::counterparty::save_counterparties;
-use crate::services::tron::address_intelligence::build_address_profiles;
-use crate::services::tron::counterparty::build_counterparty_relations;
-
 const ZERO_ADDRESS: &str = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb";
-
-const ERC20_TRANSFER_TOPIC: &str =
-    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
-fn extract_contract_type(tx: &Value) -> String {
-    tx["raw_data"]["contract"][0]["type"]
-        .as_str()
-        .unwrap_or("Unknown")
-        .to_string()
-}
-
-fn extract_owner_address(tx: &Value) -> Option<String> {
-    tx["raw_data"]["contract"][0]["parameter"]["value"]["owner_address"]
-        .as_str()
-        .and_then(normalize_tron_address)
-}
-
-fn extract_transfer_contract(tx: &Value) -> Option<(String, String, u64)> {
-    let contract = &tx["raw_data"]["contract"][0];
-
-    if contract["type"] != "TransferContract" {
-        return None;
-    }
-
-    let value = contract["parameter"]["value"]["amount"].as_u64()?;
-
-    let owner = contract["parameter"]["value"]["owner_address"].as_str()?;
-
-    let to = contract["parameter"]["value"]["to_address"].as_str()?;
-
-    let from = normalize_tron_address(owner)?;
-    let to = normalize_tron_address(to)?;
-
-    Some((from, to, value))
-}
-
-fn extract_trc20_transfers(receipt: &Value) -> Vec<(u32, String, String, String, u128)> {
-    let mut transfers = Vec::new();
-
-    let empty_logs = Vec::new();
-
-    let logs = receipt["log"].as_array().unwrap_or(&empty_logs);
-
-    for (i, log) in logs.iter().enumerate() {
-        let empty_topics = Vec::new();
-
-        let topics = log["topics"].as_array().unwrap_or(&empty_topics);
-
-        if topics.len() < 3 {
-            continue;
-        }
-
-        let topic0 = topics[0]
-            .as_str()
-            .unwrap_or("")
-            .trim_start_matches("0x")
-            .trim_start_matches("0X")
-            .to_lowercase();
-
-        if topic0 != ERC20_TRANSFER_TOPIC {
-            continue;
-        }
-
-        let Some(token) = log["address"].as_str().and_then(normalize_tron_address) else {
-            continue;
-        };
-
-        let from = normalize_tron_address(topics[1].as_str().unwrap_or(""));
-
-        let to = normalize_tron_address(topics[2].as_str().unwrap_or(""));
-
-        let amount_hex = log["data"].as_str().unwrap_or("0x0");
-
-        let amount = u128::from_str_radix(
-            amount_hex.trim_start_matches("0x").trim_start_matches("0X"),
-            16,
-        )
-        .unwrap_or(0);
-
-        if let (Some(from), Some(to)) = (from, to) {
-            transfers.push((i as u32, token, from, to, amount));
-        }
-    }
-
-    transfers
-}
-
-fn extract_raw_logs(
-    receipt: &Value,
-    tx_hash: &str,
-    block_number: u64,
-    timestamp: u64,
-) -> Vec<TronRawLogRow> {
-    let empty_logs = Vec::new();
-    let logs = receipt["log"].as_array().unwrap_or(&empty_logs);
-
-    logs.iter()
-        .enumerate()
-        .map(|(i, log)| {
-            let contract_address = log["address"]
-                .as_str()
-                .and_then(normalize_tron_address)
-                .or_else(|| log["address"].as_str().map(ToString::to_string))
-                .unwrap_or_default();
-
-            let topics = log["topics"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|topic| topic.as_str().map(ToString::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
-            TronRawLogRow {
-                tx_hash: tx_hash.to_string(),
-                block_number,
-                log_index: i as u32,
-                contract_address,
-                topics,
-                data: log["data"].as_str().unwrap_or_default().to_string(),
-                removed: 0,
-                timestamp,
-            }
-        })
-        .collect()
-}
+const MAX_REPLAY_BLOCKS: u64 = 10_000;
 
 async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Result<()> {
     let txid = tx["txID"]
@@ -190,34 +53,8 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
         .ok_or_else(|| anyhow!("Missing txID"))?
         .to_string();
 
-    let contract_type = extract_contract_type(&tx);
-
-    let mut from = String::new();
-    let mut to = String::new();
-    let mut value = 0u64;
-
-    if let Some((f, t, v)) = extract_transfer_contract(&tx) {
-        from = f;
-        to = t;
-        value = v;
-    }
-
-    let mut simple_transfers = Vec::<SimpleTransfer>::new();
-    let mut semantic_transfers = Vec::<SimpleTransfer>::new();
-
-    if !from.is_empty() && !to.is_empty() && value > 0 {
-        let transfer = SimpleTransfer {
-            token: "TRX".to_string(),
-
-            from: from.clone(),
-            to: to.clone(),
-
-            amount: value as u128,
-        };
-
-        simple_transfers.push(transfer.clone());
-        semantic_transfers.push(transfer);
-    }
+    let (contract_type, from, to, contract_address, value) = primary_contract_summary(&tx);
+    let mut canonical_transfers = extract_contract_transfers(&tx, &txid);
 
     let receipt = {
         let _permit = loader.rpc_limiter.acquire().await?;
@@ -225,17 +62,24 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
         loader.tron_client.get_tx_receipt(&txid).await?
     };
 
-    let timestamp = tx["raw_data"]["timestamp"].as_u64().unwrap_or(0);
+    if receipt["id"].as_str().is_none() {
+        return Err(anyhow!("transaction receipt is not available for {txid}"));
+    }
+
+    let timestamp = tx["raw_data"]["timestamp"]
+        .as_u64()
+        .filter(|timestamp| *timestamp > 0)
+        .ok_or_else(|| anyhow!("transaction {txid} has no valid timestamp"))?;
 
     let receipt_result = receipt["receipt"]["result"].as_str().unwrap_or("");
 
     let status = if receipt_result == "SUCCESS" { 1 } else { 0 };
 
-    let fee = receipt["fee"].as_u64().unwrap_or(0) as u128;
+    let fee = UInt256::from(receipt["fee"].as_u64().unwrap_or(0));
 
-    let energy_fee = receipt["energy_fee"].as_u64().unwrap_or(0) as u128;
+    let energy_fee = UInt256::from(receipt["energy_fee"].as_u64().unwrap_or(0));
 
-    let net_fee = receipt["net_fee"].as_u64().unwrap_or(0) as u128;
+    let net_fee = UInt256::from(receipt["net_fee"].as_u64().unwrap_or(0));
 
     let energy_usage = receipt["receipt"]["energy_usage"].as_u64().unwrap_or(0);
 
@@ -245,20 +89,22 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
 
     let net_usage = receipt["receipt"]["net_usage"].as_u64().unwrap_or(0);
 
-    // contract classifier
-    let contract_address = tx["raw_data"]["contract"][0]["parameter"]["value"]["contract_address"]
-        .as_str()
-        .and_then(normalize_tron_address)
-        .unwrap_or_default();
-    let owner_address = extract_owner_address(&tx).unwrap_or_default();
-
-    if from.is_empty() && !owner_address.is_empty() {
-        from = owner_address.clone();
+    if status == 1 {
+        canonical_transfers.extend(extract_trc20_transfers(&receipt, &txid)?);
+        canonical_transfers.extend(extract_internal_transfers(&receipt, &txid));
+    } else {
+        canonical_transfers.clear();
     }
 
-    if to.is_empty() && !contract_address.is_empty() {
-        to = contract_address.clone();
-    }
+    let semantic_transfers = canonical_transfers
+        .iter()
+        .map(|transfer| transfer.as_simple_transfer())
+        .collect::<Vec<SimpleTransfer>>();
+    let simple_transfers = semantic_transfers
+        .iter()
+        .filter(|transfer| transfer.from != ZERO_ADDRESS && transfer.to != ZERO_ADDRESS)
+        .cloned()
+        .collect::<Vec<_>>();
 
     loader
         .transaction_batcher
@@ -274,7 +120,7 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
 
             contract_type: contract_type.clone(),
 
-            amount: value as u128,
+            amount: value,
             fee,
             energy_fee,
             net_fee,
@@ -286,71 +132,33 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
         })
         .await?;
 
-    for raw_log in extract_raw_logs(&receipt, &txid, block_number, timestamp) {
-        loader.raw_log_batcher.push(raw_log).await?;
-    }
-
-    let transfers = extract_trc20_transfers(&receipt);
-
     let mut discovered_tokens = HashSet::<String>::new();
 
-    for (log_index, token, from_addr, to_addr, amount) in transfers {
-        loader
-            .token_transfer_batcher
-            .push(TronTokenTransferRow {
-                tx_hash: txid.clone(),
-                block_number,
-                timestamp,
-
-                log_index,
-
-                token_address: token.clone(),
-
-                from_address: from_addr.clone(),
-
-                to_address: to_addr.clone(),
-
-                amount,
-
-                is_mint: (from_addr == ZERO_ADDRESS) as u8,
-
-                is_burn: (to_addr == ZERO_ADDRESS) as u8,
-
-                event_signature: ERC20_TRANSFER_TOPIC.to_string(),
-            })
-            .await?;
-
-        discovered_tokens.insert(token.clone());
-
-        let semantic_transfer = SimpleTransfer {
-            token,
-            from: from_addr,
-            to: to_addr,
-            amount,
-        };
-
-        semantic_transfers.push(semantic_transfer.clone());
-
-        if semantic_transfer.from != ZERO_ADDRESS && semantic_transfer.to != ZERO_ADDRESS {
-            simple_transfers.push(semantic_transfer);
+    for transfer in &canonical_transfers {
+        if transfer.kind == TransferKind::Trc20 {
+            discovered_tokens.insert(transfer.asset_id.clone());
         }
     }
 
     // token metadata worker
     if !discovered_tokens.is_empty() {
-        let tokens: Vec<String> = discovered_tokens.into_iter().collect();
-
-        tron_metadata_worker::process_new_tokens(loader.clone(), tokens).await?;
+        let updated_at_unix_ms = Utc::now().timestamp_millis().max(0) as u64;
+        for token_address in discovered_tokens {
+            loader
+                .token_metadata_discovery_batcher
+                .push(crate::models::tron::modules::TokenMetadataDiscoveryRow {
+                    token_address,
+                    discovered_block: block_number,
+                    discovered_at_unix_ms: updated_at_unix_ms,
+                })
+                .await?;
+        }
     }
-
-    let method_data = tx["raw_data"]["contract"][0]["parameter"]["value"]["data"]
-        .as_str()
-        .map(|s| s.to_string());
 
     let classification = classify(
         &ClassificationInput {
             contract_address: contract_address.clone(),
-            method_data,
+            method_data: primary_method_data(&tx),
         },
         &semantic_transfers,
     );
@@ -359,30 +167,13 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
         ContractCategory::Dex | ContractCategory::Bridge | ContractCategory::Lending => 1,
 
         _ => {
-            if contract_type == "TriggerSmartContract" {
+            if has_contract_call(&tx) {
                 1
             } else {
                 0
             }
         }
     };
-
-    // save contract metadata
-    if !contract_address.is_empty() {
-        let row = ContractMetadataRow {
-            contract_address: contract_address.clone(),
-
-            protocol_name: classification.protocol.clone(),
-
-            contract_type: classification.category.to_string(),
-
-            creator_address: from.clone(),
-
-            created_at_block: block_number,
-        };
-
-        loader.contract_metadata_batcher.push(row).await?;
-    }
 
     // AML features
     if !semantic_transfers.is_empty() {
@@ -429,66 +220,24 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
         aml_events.extend(mint_burns.clone());
         aml_events.extend(liquidity_events.clone());
 
-        // risk engine
-        let (risk_score, risk_level) = compute_risk_score(
-            &classification,
-            !swaps.is_empty(),
-            !bridges.is_empty(),
-            unique_tokens,
-            participants,
-        );
-
-        let relationships = build_relationships(
+        for event in build_semantic_event_rows(
             &txid,
             block_number,
-            tx["raw_data"]["timestamp"].as_u64().unwrap_or(0),
-            &simple_transfers,
+            timestamp,
             &aml_events,
             &classification.protocol,
-            risk_score,
-        );
+            &classification.detection_source,
+            classification.confidence,
+        ) {
+            loader.semantic_event_batcher.push(event).await?;
+        }
+
+        let relationships =
+            build_relationships(&txid, block_number, timestamp, &canonical_transfers);
 
         for row in relationships {
             loader.relationship_batcher.push(row).await?;
         }
-
-        // historical address intelligence
-        let profiles = build_address_profiles(&simple_transfers);
-        let mut profile_rows = Vec::<AddressProfileRow>::new();
-
-        for (_, profile) in profiles {
-            profile_rows.push(AddressProfileRow {
-                address: profile.address,
-                total_in_tx: profile.total_in_tx,
-                total_out_tx: profile.total_out_tx,
-                unique_senders: profile.unique_senders,
-                unique_receivers: profile.unique_receivers,
-                total_volume_in: profile.total_volume_in,
-                total_volume_out: profile.total_volume_out,
-                interacted_tokens: profile.interacted_tokens.len() as u32,
-                probable_exchange: profile.probable_exchange as u8,
-                probable_deposit_wallet: profile.probable_deposit_wallet as u8,
-                probable_sweeper: profile.probable_sweeper as u8,
-                risk_score: profile.risk_score,
-            });
-        }
-        save_address_profiles(loader.clickhouse.clone(), profile_rows).await?;
-
-        let counterparty_rows = build_counterparty_relations(&simple_transfers, block_number)
-            .into_iter()
-            .map(|relation| CounterpartyRow {
-                address: relation.address,
-                counterparty: relation.counterparty,
-                direction: relation.direction,
-                token_address: relation.token_address,
-                total_txs: relation.total_txs,
-                total_volume: relation.total_volume,
-                first_seen: relation.first_seen,
-                last_seen: relation.last_seen,
-            })
-            .collect::<Vec<_>>();
-
-        save_counterparties(loader.clickhouse.clone(), counterparty_rows).await?;
 
         let exchange_detections = detect_exchange_attributions(
             loader.clickhouse.clone(),
@@ -496,42 +245,6 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
             &simple_transfers,
         )
         .await?;
-
-        for detection in &exchange_detections {
-            let address = detection.address.clone();
-
-            save_exchange_entity(
-                loader.clickhouse.clone(),
-                ExchangeEntityRow {
-                    entity_id: address.entity_id.clone(),
-                    exchange_name: address.exchange_name.clone(),
-                    exchange_type: "centralized_exchange".to_string(),
-                    confidence: address.confidence,
-                },
-            )
-            .await?;
-
-            save_address_entity(
-                loader.clickhouse.clone(),
-                AddressEntityRow {
-                    address: address.address.clone(),
-                    entity_id: address.entity_id.clone(),
-                    entity_name: address.exchange_name.clone(),
-                    entity_type: format!("exchange_{}", address.address_role.to_lowercase()),
-                    confidence: address.confidence,
-                    source: address.detection_source.clone(),
-                },
-            )
-            .await?;
-
-            save_exchange_address(loader.clickhouse.clone(), address).await?;
-
-            if let Some(deposit) = detection.deposit.clone() {
-                save_exchange_deposit_address(loader.clickhouse.clone(), deposit).await?;
-            }
-
-            save_exchange_cluster(loader.clickhouse.clone(), detection.cluster.clone()).await?;
-        }
 
         let exchange_flows = build_exchange_flows(
             &loader.clickhouse,
@@ -580,28 +293,6 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
 
         loader.transaction_feature_batcher.push(feature).await?;
 
-        let risk_row = TransactionRiskRow {
-            tx_hash: txid.clone(),
-            block_number,
-            timestamp,
-            risk_score,
-            risk_level,
-            transaction_type: semantics.transaction_type.clone(),
-            transaction_subtype: semantics.transaction_subtype.clone(),
-            is_swap: semantics.is_swap,
-            is_bridge: semantics.is_bridge,
-            is_contract_call,
-            unique_tokens,
-            participants,
-            risk_reasons: vec![format!(
-                "transaction_type:{}:{}",
-                semantics.transaction_type, semantics.transaction_subtype
-            )],
-            touches_exchange: (!exchange_flows.is_empty()) as u8,
-        };
-
-        loader.transaction_risk_batcher.push(risk_row).await?;
-
         for flow in exchange_flows {
             loader.exchange_flow_batcher.push(flow).await?;
         }
@@ -622,9 +313,6 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
             liquidity_events: &[],
             exchange_flows: &[],
         });
-        let (risk_score, risk_level) =
-            compute_risk_score(&classification, false, false, 0, participants);
-
         loader
             .transaction_feature_batcher
             .push(TransactionFeatureRow {
@@ -651,87 +339,236 @@ async fn process_tx(loader: Arc<LoaderTron>, tx: Value, block_number: u64) -> Re
                 fan_out: (!to.is_empty()) as u16,
             })
             .await?;
-
-        loader
-            .transaction_risk_batcher
-            .push(TransactionRiskRow {
-                tx_hash: txid.clone(),
-                block_number,
-                timestamp,
-                risk_score,
-                risk_level,
-                transaction_type: semantics.transaction_type.clone(),
-                transaction_subtype: semantics.transaction_subtype.clone(),
-                is_swap: semantics.is_swap,
-                is_bridge: semantics.is_bridge,
-                is_contract_call,
-                unique_tokens: 0,
-                participants,
-                risk_reasons: vec![format!(
-                    "transaction_type:{}:{}",
-                    semantics.transaction_type, semantics.transaction_subtype
-                )],
-                touches_exchange: 0,
-            })
-            .await?;
     }
 
     Ok(())
 }
 
-pub async fn fetch_tron(loader: Arc<LoaderTron>, start_block: u64, total_txs: u64) -> Result<()> {
-    let latest_block = loader.tron_client.get_block_number().await?;
+#[derive(Debug, Clone, Copy)]
+struct FetchOptions {
+    end_block: Option<u64>,
+    force_replay: bool,
+    advance_checkpoint: bool,
+}
 
-    println!("TRON Latest Block: {}", latest_block);
+pub async fn fetch_tron(loader: Arc<LoaderTron>, start_block: u64, total_txs: u64) -> Result<()> {
+    fetch_tron_with_options(
+        loader,
+        start_block,
+        total_txs,
+        FetchOptions {
+            end_block: None,
+            force_replay: false,
+            advance_checkpoint: true,
+        },
+    )
+    .await
+}
+
+pub async fn replay_tron_range(
+    loader: Arc<LoaderTron>,
+    start_block: u64,
+    end_block: u64,
+) -> Result<()> {
+    validate_replay_range(start_block, end_block)?;
+
+    fetch_tron_with_options(
+        loader,
+        start_block,
+        0,
+        FetchOptions {
+            end_block: Some(end_block),
+            force_replay: true,
+            advance_checkpoint: false,
+        },
+    )
+    .await
+}
+
+pub async fn ingest_tron_range(
+    loader: Arc<LoaderTron>,
+    start_block: u64,
+    end_block: u64,
+) -> Result<()> {
+    validate_replay_range(start_block, end_block)?;
+
+    fetch_tron_with_options(
+        loader,
+        start_block,
+        0,
+        FetchOptions {
+            end_block: Some(end_block),
+            force_replay: false,
+            advance_checkpoint: false,
+        },
+    )
+    .await
+}
+
+async fn fetch_tron_with_options(
+    loader: Arc<LoaderTron>,
+    start_block: u64,
+    total_txs: u64,
+    options: FetchOptions,
+) -> Result<()> {
+    let latest_block = loader.tron_client.get_solid_block_number().await?;
+    let end_block = options.end_block.unwrap_or(latest_block);
+
+    if end_block > latest_block {
+        return Err(anyhow!(
+            "requested TRON end block {end_block} is above latest solid block {latest_block}"
+        ));
+    }
+
+    println!(
+        "TRON Latest Solid Block: {} | processing range {}..={}",
+        latest_block, start_block, end_block
+    );
 
     let mut tx_count = 0u64;
 
     let mut current_block = start_block;
 
-    let mut last_synced_block = None::<u64>;
-
-    while current_block <= latest_block {
-        if tx_count >= total_txs {
+    while current_block <= end_block {
+        if total_txs > 0 && tx_count >= total_txs {
             break;
         }
 
-        let block = {
+        let block_result = {
             let _permit = loader.rpc_limiter.acquire().await?;
 
-            loader.tron_client.get_block(current_block).await?
+            loader.tron_client.get_block(current_block).await
+        };
+        let block = match block_result {
+            Ok(block) => block,
+            Err(error) => {
+                record_error(
+                    &loader.clickhouse,
+                    current_block,
+                    "",
+                    "",
+                    "FETCH_BLOCK",
+                    &error,
+                )
+                .await?;
+                return Err(error)
+                    .with_context(|| format!("failed to fetch TRON block {current_block}"));
+            }
         };
 
         let empty_txs = Vec::new();
 
         let txs = block["transactions"].as_array().unwrap_or(&empty_txs);
+        let block_hash_result = block["blockID"]
+            .as_str()
+            .filter(|hash| !hash.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("TRON block {current_block} has no blockID"));
+        let block_hash = match block_hash_result {
+            Ok(block_hash) => block_hash,
+            Err(error) => {
+                record_error(
+                    &loader.clickhouse,
+                    current_block,
+                    "",
+                    "",
+                    "VALIDATE_BLOCK",
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let parent_hash = block["block_header"]["raw_data"]["parentHash"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let block_timestamp = block["block_header"]["raw_data"]["timestamp"]
+            .as_u64()
+            .unwrap_or_default();
+
+        let should_ingest = match should_ingest_block(
+            &loader.clickhouse,
+            current_block,
+            &block_hash,
+            options.force_replay,
+        )
+        .await
+        {
+            Ok(should_ingest) => should_ingest,
+            Err(error) => {
+                let (error_class, retryable) =
+                    if error.downcast_ref::<FinalizedHashConflict>().is_some() {
+                        ("HASH_CONFLICT", false)
+                    } else {
+                        classify_ingestion_error(&error)
+                    };
+                record_ingestion_failure(
+                    &loader.clickhouse,
+                    current_block,
+                    &block_hash,
+                    "",
+                    "CANONICALITY",
+                    error_class,
+                    &format!("{error:#}"),
+                    retryable,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+
+        if !should_ingest {
+            resolve_ingestion_failures(&loader.clickhouse, current_block).await?;
+
+            if options.advance_checkpoint {
+                save_sync_state(loader.clickhouse.clone(), "tron", current_block).await?;
+            }
+            current_block += 1;
+            continue;
+        }
+
+        record_processing_block(
+            &loader.clickhouse,
+            current_block,
+            block_hash.clone(),
+            parent_hash.clone(),
+            block_timestamp,
+            txs.len() as u32,
+        )
+        .await?;
 
         if txs.is_empty() {
             println!("[TRON] block {} has 0 transaction(s)", current_block);
 
-            last_synced_block = Some(current_block);
+            record_ingested_block(
+                &loader.clickhouse,
+                current_block,
+                block_hash,
+                parent_hash,
+                block_timestamp,
+                0,
+            )
+            .await?;
 
-            save_sync_state(loader.clickhouse.clone(), "tron", current_block).await?;
+            if options.advance_checkpoint {
+                save_sync_state(loader.clickhouse.clone(), "tron", current_block).await?;
+            }
 
             current_block += 1;
 
             continue;
         }
 
-        let mut fully_processed = true;
-
-        let tx_vec = txs.to_vec();
-
-        let remaining = total_txs.saturating_sub(tx_count);
-
-        let tx_vec = tx_vec
-            .into_iter()
-            .take(remaining as usize)
-            .collect::<Vec<_>>();
-
-        if tx_vec.len() < txs.len() {
-            fully_processed = false;
+        if total_txs > 0 && tx_count > 0 && tx_count.saturating_add(txs.len() as u64) > total_txs {
+            println!(
+                "[TRON] stopping before block {} to preserve block-level checkpoint integrity",
+                current_block
+            );
+            break;
         }
 
+        let tx_vec = txs.to_vec();
         let block_tx_total = tx_vec.len() as u64;
 
         println!(
@@ -748,11 +585,12 @@ pub async fn fetch_tron(loader: Arc<LoaderTron>, start_block: u64, total_txs: u6
         let tx_errors = stream::iter(tx_vec)
             .map(|tx| {
                 let loader_clone = loader.clone();
+                let tx_hash = tx["txID"].as_str().unwrap_or_default().to_string();
 
-                async move { process_tx(loader_clone, tx, current_block).await }
+                async move { (tx_hash, process_tx(loader_clone, tx, current_block).await) }
             })
             .buffer_unordered(loader.config.tx_worker_concurrency)
-            .filter_map(|res| {
+            .filter_map(|(tx_hash, res)| {
                 let processed_in_block = processed_in_block.clone();
 
                 async move {
@@ -778,7 +616,7 @@ pub async fn fetch_tron(loader: Arc<LoaderTron>, start_block: u64, total_txs: u6
                                 current_block, processed, block_tx_total, err
                             );
 
-                            Some(err)
+                            Some((tx_hash, err))
                         }
                     }
                 }
@@ -786,39 +624,209 @@ pub async fn fetch_tron(loader: Arc<LoaderTron>, start_block: u64, total_txs: u6
             .collect::<Vec<_>>()
             .await;
 
-        if let Some(err) = tx_errors.into_iter().next() {
-            return Err(err)
-                .with_context(|| format!("failed to process TRON block {}", current_block));
+        if !tx_errors.is_empty() {
+            let mut first_error = None;
+
+            for (tx_hash, error) in tx_errors {
+                record_error(
+                    &loader.clickhouse,
+                    current_block,
+                    &block_hash,
+                    &tx_hash,
+                    "PROCESS_TX",
+                    &error,
+                )
+                .await?;
+
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+
+            if let Err(flush_error) = loader.flush_batches().await {
+                record_error(
+                    &loader.clickhouse,
+                    current_block,
+                    &block_hash,
+                    "",
+                    "FLUSH_AFTER_TX_FAILURE",
+                    &flush_error,
+                )
+                .await?;
+            }
+
+            let first_error = first_error.expect("transaction errors are not empty");
+            record_failed_block(
+                &loader.clickhouse,
+                current_block,
+                block_hash,
+                parent_hash,
+                block_timestamp,
+                block_tx_total as u32,
+                format!("{first_error:#}"),
+            )
+            .await?;
+
+            return Err(first_error)
+                .with_context(|| format!("failed to process TRON block {current_block}"));
         }
 
-        if fully_processed {
-            last_synced_block = Some(current_block);
+        if let Err(error) = loader.flush_batches().await {
+            record_error(
+                &loader.clickhouse,
+                current_block,
+                &block_hash,
+                "",
+                "FLUSH_BLOCK",
+                &error,
+            )
+            .await?;
+            record_failed_block(
+                &loader.clickhouse,
+                current_block,
+                block_hash,
+                parent_hash,
+                block_timestamp,
+                block_tx_total as u32,
+                format!("{error:#}"),
+            )
+            .await?;
+            return Err(error)
+                .with_context(|| format!("failed to flush TRON block {current_block}"));
+        }
 
-            loader.flush_batches().await?;
+        record_ingested_block(
+            &loader.clickhouse,
+            current_block,
+            block_hash,
+            parent_hash,
+            block_timestamp,
+            block_tx_total as u32,
+        )
+        .await?;
 
+        if options.advance_checkpoint {
             save_sync_state(loader.clickhouse.clone(), "tron", current_block).await?;
-
-            println!(
-                "TRON synced block {} | total tx {}",
-                current_block, tx_count
-            );
-        } else {
-            println!(
-                "TRON stopped mid-block {} | total tx {}",
-                current_block, tx_count
-            );
-
-            break;
         }
+
+        println!(
+            "TRON synced block {} | total tx {}",
+            current_block, tx_count
+        );
 
         current_block += 1;
     }
 
     loader.flush_batches().await?;
 
-    if let Some(last_synced_block) = last_synced_block {
-        save_sync_state(loader.clickhouse.clone(), "tron", last_synced_block).await?;
+    Ok(())
+}
+
+fn validate_replay_range(start_block: u64, end_block: u64) -> Result<()> {
+    if end_block < start_block {
+        return Err(anyhow!(
+            "TRON replay end block {end_block} is below start block {start_block}"
+        ));
+    }
+
+    let block_count = end_block
+        .checked_sub(start_block)
+        .and_then(|difference| difference.checked_add(1))
+        .ok_or_else(|| anyhow!("TRON replay range overflowed"))?;
+
+    if block_count > MAX_REPLAY_BLOCKS {
+        return Err(anyhow!(
+            "TRON replay range contains {block_count} blocks; maximum is {MAX_REPLAY_BLOCKS}"
+        ));
     }
 
     Ok(())
+}
+
+async fn record_error(
+    clickhouse: &clickhouse::Client,
+    block_number: u64,
+    block_hash: &str,
+    tx_hash: &str,
+    stage: &str,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let (error_class, retryable) = classify_ingestion_error(error);
+
+    record_ingestion_failure(
+        clickhouse,
+        block_number,
+        block_hash,
+        tx_hash,
+        stage,
+        error_class,
+        &format!("{error:#}"),
+        retryable,
+    )
+    .await
+}
+
+fn classify_ingestion_error(error: &anyhow::Error) -> (&'static str, bool) {
+    if error.downcast_ref::<FinalizedHashConflict>().is_some() {
+        return ("HASH_CONFLICT", false);
+    }
+
+    let message = format!("{error:#}").to_ascii_lowercase();
+
+    if [
+        "timeout",
+        "timed out",
+        "http request",
+        "connection",
+        "429",
+        "frequency",
+        "receipt is not available",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        return ("RPC_TRANSIENT", true);
+    }
+
+    if [
+        "missing",
+        "no valid",
+        "invalid",
+        "decode",
+        "deserialize",
+        "malformed",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        return ("DATA_VALIDATION", false);
+    }
+
+    ("PROCESSING", true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_range_is_inclusive_and_bounded() {
+        assert!(validate_replay_range(1, 10_000).is_ok());
+        assert!(validate_replay_range(1, 10_001).is_err());
+        assert!(validate_replay_range(2, 1).is_err());
+    }
+
+    #[test]
+    fn classifies_missing_receipt_as_retryable_rpc_failure() {
+        let error = anyhow!("transaction receipt is not available");
+
+        assert_eq!(classify_ingestion_error(&error), ("RPC_TRANSIENT", true));
+    }
+
+    #[test]
+    fn classifies_invalid_block_data_as_non_retryable() {
+        let error = anyhow!("TRON block 10 has no valid timestamp");
+
+        assert_eq!(classify_ingestion_error(&error), ("DATA_VALIDATION", false));
+    }
 }

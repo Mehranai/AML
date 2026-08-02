@@ -12,7 +12,6 @@ pub async fn merge_transfer_edge(
     amount: &str,
     block_number: u64,
     timestamp: u64,
-    risk_score: u8,
     transfer_type: &str,
     operation_type: &str,
     relationship_type: &str,
@@ -25,7 +24,7 @@ pub async fn merge_transfer_edge(
 
     let delete_previous_edge = query(
         "
-        MATCH (a:Wallet { address: $from })-[old { id: $edge_id }]->(b:Wallet { address: $to })
+        MATCH (a:Wallet { chain: 'tron', address: $from })-[old { id: $edge_id }]->(b:Wallet { chain: 'tron', address: $to })
         DELETE old
         ",
     )
@@ -41,9 +40,9 @@ pub async fn merge_transfer_edge(
 
     let q = query(&format!(
         "
-        MERGE (a:Wallet {{ address: $from }})
+        MERGE (a:Wallet {{ chain: 'tron', address: $from }})
         SET a:TronAddress
-        MERGE (b:Wallet {{ address: $to }})
+        MERGE (b:Wallet {{ chain: 'tron', address: $to }})
         SET b:TronAddress
         MERGE (a)-[t:{relationship_type} {{ id: $edge_id }}]->(b)
         SET t.tx_hash = $tx_hash,
@@ -51,7 +50,6 @@ pub async fn merge_transfer_edge(
             t.amount = $amount,
             t.block_number = $block_number,
             t.timestamp = $timestamp,
-            t.risk_score = $risk_score,
             t.transfer_type = $transfer_type,
             t.operation_type = $operation_type,
             t.exchange_flow_type = $exchange_flow_type,
@@ -69,7 +67,6 @@ pub async fn merge_transfer_edge(
     .param("amount", amount)
     .param("block_number", block_number as i64)
     .param("timestamp", timestamp as i64)
-    .param("risk_score", risk_score as i64)
     .param("transfer_type", transfer_type)
     .param("operation_type", operation_type)
     .param("exchange_flow_type", exchange_flow_type.unwrap_or(""))
@@ -129,10 +126,10 @@ pub async fn merge_exchange_interaction(
 
     let q = query(
         "
-        MERGE (w:Wallet { address: $wallet_address })
+        MERGE (w:Wallet { chain: 'tron', address: $wallet_address })
         SET w:TronAddress
 
-        MERGE (exchange_wallet:Wallet { address: $exchange_address })
+        MERGE (exchange_wallet:Wallet { chain: 'tron', address: $exchange_address })
         SET exchange_wallet:TronAddress,
             exchange_wallet.node_type = 'exchange_wallet',
             exchange_wallet.exchange_name = $exchange_name,

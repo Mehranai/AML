@@ -1,58 +1,365 @@
-use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
+use chrono::Utc;
+use clickhouse::Client;
+use ethers::abi::{ParamType, Token, decode};
+use ethers::types::U256;
+use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 
+use crate::config::AppConfig;
+use crate::helper::tron::TronClient;
 use crate::models::token_metadata::TokenMetadataRow;
 use crate::progress::core::save_token_metadata;
-use crate::services::loader::LoaderTron;
 
-pub async fn fetch_token_metadata(
-    loader: Arc<LoaderTron>,
-    token_address: &str,
-) -> Result<Option<TokenMetadataRow>> {
-    let resp = {
-        let _permit = loader.rpc_limiter.acquire().await?;
-        loader
-            .tron_client
-            .post(
-                "wallet/getcontract",
-                serde_json::json!({
-                    "value": token_address,
-                    "visible": true
-                }),
-            )
-            .await?
-    };
+const METADATA_OWNER_ADDRESS: &str = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb";
 
-    let name = resp["name"].as_str().unwrap_or("").to_string();
-
-    if name.is_empty() {
-        return Ok(None);
-    }
-
-    // Tron is messy → best-effort parsing
-    let symbol = resp["symbol"].as_str().unwrap_or("UNKNOWN").to_string();
-    let decimals = resp["decimals"].as_u64().unwrap_or(6) as u8;
-
-    Ok(Some(TokenMetadataRow {
-        token_address: token_address.to_string(),
-        name,
-        symbol,
-        decimals,
-        total_supply: "0".to_string(),
-        is_verified: 0,
-    }))
+#[derive(Debug, Deserialize, clickhouse::Row)]
+struct PendingMetadataJob {
+    token_address: String,
+    discovered_block: u64,
+    attempt_count: u8,
 }
 
-pub async fn process_new_tokens(loader: Arc<LoaderTron>, tokens: Vec<String>) -> Result<()> {
-    let unique: HashSet<_> = tokens.into_iter().collect();
+#[derive(Debug, Clone, Serialize, clickhouse::Row)]
+struct TokenMetadataJobState {
+    token_address: String,
+    discovered_block: u64,
+    status: String,
+    attempt_count: u8,
+    last_error: String,
+    updated_at_unix_ms: u64,
+}
 
-    for token in unique {
-        if let Some(meta) = fetch_token_metadata(loader.clone(), &token).await? {
-            save_token_metadata(loader.clickhouse.clone(), meta).await?;
+pub async fn run_token_metadata_worker(config: AppConfig) -> Result<()> {
+    let clickhouse = Arc::new(
+        Client::default()
+            .with_url(&config.clickhouse_url)
+            .with_user(&config.clickhouse_user)
+            .with_password(&config.clickhouse_pass)
+            .with_database(&config.clickhouse_db_tron),
+    );
+    let rpc_url = config
+        .tron_rpc_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("TRON_RPC_URL or TRON_RPC_HTTP must be configured"))?;
+    let tron_client = Arc::new(TronClient::new(
+        rpc_url,
+        config.tron_api_key.clone(),
+        config.rpc_timeout_seconds,
+    )?);
+    let poll_interval = Duration::from_secs(config.tron_metadata_poll_interval_seconds.max(1));
+
+    println!(
+        "[TRON METADATA] worker started (batch_size={}, max_attempts={})",
+        config.tron_metadata_batch_size, config.tron_metadata_max_attempts
+    );
+
+    loop {
+        let jobs = load_pending_jobs(
+            &clickhouse,
+            config.tron_metadata_batch_size,
+            config.tron_metadata_max_attempts,
+        )
+        .await?;
+
+        if jobs.is_empty() {
+            sleep(poll_interval).await;
+            continue;
+        }
+
+        for job in jobs {
+            process_metadata_job(
+                clickhouse.clone(),
+                tron_client.clone(),
+                job,
+                config.tron_metadata_max_attempts,
+            )
+            .await;
+        }
+    }
+}
+
+async fn load_pending_jobs(
+    clickhouse: &Client,
+    batch_size: u64,
+    max_attempts: u8,
+) -> Result<Vec<PendingMetadataJob>> {
+    clickhouse
+        .query(
+            r#"
+            SELECT
+                discovery.token_address,
+                discovery.discovered_block,
+                if(job.token_address = '', toUInt8(0), job.attempt_count) AS attempt_count
+            FROM token_metadata_discoveries FINAL AS discovery
+            LEFT JOIN token_metadata FINAL AS metadata
+                ON metadata.token_address = discovery.token_address
+            LEFT JOIN token_metadata_jobs FINAL AS job
+                ON job.token_address = discovery.token_address
+            WHERE metadata.token_address = ''
+              AND (
+                    job.token_address = ''
+                    OR (job.status = 'RETRY' AND job.attempt_count < ?)
+                  )
+            ORDER BY discovery.discovered_block, discovery.token_address
+            LIMIT ?
+            "#,
+        )
+        .bind(max_attempts)
+        .bind(batch_size.max(1))
+        .fetch_all::<PendingMetadataJob>()
+        .await
+        .context("failed to load pending TRON token metadata jobs")
+}
+
+async fn process_metadata_job(
+    clickhouse: Arc<Client>,
+    tron_client: Arc<TronClient>,
+    job: PendingMetadataJob,
+    max_attempts: u8,
+) {
+    let attempt_count = job.attempt_count.saturating_add(1);
+
+    match fetch_token_metadata(&tron_client, &job.token_address).await {
+        Ok(metadata) => {
+            if let Err(error) = save_token_metadata(clickhouse.clone(), metadata).await {
+                record_metadata_failure(
+                    &clickhouse,
+                    &job,
+                    attempt_count,
+                    max_attempts,
+                    format!("failed to persist metadata: {error:#}"),
+                )
+                .await;
+                return;
+            }
+
+            if let Err(error) = write_job_state(
+                &clickhouse,
+                TokenMetadataJobState {
+                    token_address: job.token_address.clone(),
+                    discovered_block: job.discovered_block,
+                    status: "COMPLETE".to_string(),
+                    attempt_count,
+                    last_error: String::new(),
+                    updated_at_unix_ms: now_unix_ms(),
+                },
+            )
+            .await
+            {
+                eprintln!(
+                    "[TRON METADATA] failed to mark {} complete: {error:#}",
+                    job.token_address
+                );
+            } else {
+                println!(
+                    "[TRON METADATA] resolved {} on attempt {}",
+                    job.token_address, attempt_count
+                );
+            }
+        }
+        Err(error) => {
+            record_metadata_failure(
+                &clickhouse,
+                &job,
+                attempt_count,
+                max_attempts,
+                format!("{error:#}"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn record_metadata_failure(
+    clickhouse: &Client,
+    job: &PendingMetadataJob,
+    attempt_count: u8,
+    max_attempts: u8,
+    error: String,
+) {
+    let status = if attempt_count >= max_attempts {
+        "FAILED"
+    } else {
+        "RETRY"
+    };
+    let last_error = truncate_error(&error);
+    let result = write_job_state(
+        clickhouse,
+        TokenMetadataJobState {
+            token_address: job.token_address.clone(),
+            discovered_block: job.discovered_block,
+            status: status.to_string(),
+            attempt_count,
+            last_error: last_error.clone(),
+            updated_at_unix_ms: now_unix_ms(),
+        },
+    )
+    .await;
+
+    if let Err(write_error) = result {
+        eprintln!(
+            "[TRON METADATA] {} attempt {} failed ({last_error}); state write also failed: {write_error:#}",
+            job.token_address, attempt_count
+        );
+    } else {
+        eprintln!(
+            "[TRON METADATA] {} attempt {} -> {}: {}",
+            job.token_address, attempt_count, status, last_error
+        );
+    }
+}
+
+async fn write_job_state(clickhouse: &Client, state: TokenMetadataJobState) -> Result<()> {
+    let mut insert = clickhouse
+        .insert::<TokenMetadataJobState>("token_metadata_jobs")
+        .await?;
+    insert.write(&state).await?;
+    insert.end().await?;
+    Ok(())
+}
+
+pub async fn fetch_token_metadata(
+    tron_client: &TronClient,
+    token_address: &str,
+) -> Result<TokenMetadataRow> {
+    let symbol = call_string(tron_client, token_address, "symbol()")
+        .await
+        .context("symbol() failed")?;
+    let name = call_string(tron_client, token_address, "name()")
+        .await
+        .unwrap_or_else(|_| symbol.clone());
+    let decimals_value = call_uint(tron_client, token_address, "decimals()")
+        .await
+        .context("decimals() failed")?;
+    if decimals_value > U256::from(u8::MAX) {
+        return Err(anyhow!("decimals() returned an out-of-range value"));
+    }
+    let decimals = decimals_value.as_u32() as u8;
+    let total_supply = call_uint(tron_client, token_address, "totalSupply()")
+        .await
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    Ok(TokenMetadataRow {
+        token_address: token_address.to_string(),
+        name: sanitize_metadata_text(&name),
+        symbol: sanitize_metadata_text(&symbol),
+        decimals,
+        total_supply,
+        is_verified: 0,
+    })
+}
+
+async fn call_string(
+    tron_client: &TronClient,
+    contract_address: &str,
+    function_selector: &str,
+) -> Result<String> {
+    let bytes = call_constant(tron_client, contract_address, function_selector).await?;
+
+    if let Ok(tokens) = decode(&[ParamType::String], &bytes)
+        && let Some(Token::String(value)) = tokens.into_iter().next()
+        && !value.trim_matches('\0').trim().is_empty()
+    {
+        return Ok(value);
+    }
+
+    if let Ok(tokens) = decode(&[ParamType::FixedBytes(32)], &bytes)
+        && let Some(Token::FixedBytes(value)) = tokens.into_iter().next()
+    {
+        let value = String::from_utf8_lossy(&value)
+            .trim_matches('\0')
+            .trim()
+            .to_string();
+        if !value.is_empty() {
+            return Ok(value);
         }
     }
 
-    Ok(())
+    Err(anyhow!(
+        "{function_selector} did not return a supported ABI string"
+    ))
+}
+
+async fn call_uint(
+    tron_client: &TronClient,
+    contract_address: &str,
+    function_selector: &str,
+) -> Result<U256> {
+    let bytes = call_constant(tron_client, contract_address, function_selector).await?;
+    let tokens = decode(&[ParamType::Uint(256)], &bytes)
+        .with_context(|| format!("{function_selector} returned invalid ABI uint data"))?;
+
+    match tokens.into_iter().next() {
+        Some(Token::Uint(value)) => Ok(value),
+        _ => Err(anyhow!("{function_selector} did not return an ABI uint")),
+    }
+}
+
+async fn call_constant(
+    tron_client: &TronClient,
+    contract_address: &str,
+    function_selector: &str,
+) -> Result<Vec<u8>> {
+    let response = tron_client
+        .post(
+            "wallet/triggerconstantcontract",
+            serde_json::json!({
+                "owner_address": METADATA_OWNER_ADDRESS,
+                "contract_address": contract_address,
+                "function_selector": function_selector,
+                "parameter": "",
+                "visible": true
+            }),
+        )
+        .await?;
+
+    if !response["result"]["result"].as_bool().unwrap_or(false) {
+        return Err(anyhow!(
+            "contract rejected {function_selector}: {}",
+            response["result"]["message"]
+                .as_str()
+                .unwrap_or("unknown contract error")
+        ));
+    }
+
+    let encoded = response["constant_result"][0]
+        .as_str()
+        .ok_or_else(|| anyhow!("{function_selector} returned no constant_result"))?;
+    hex::decode(encoded.trim_start_matches("0x"))
+        .with_context(|| format!("{function_selector} returned invalid hex"))
+}
+
+fn sanitize_metadata_text(value: &str) -> String {
+    value.trim_matches('\0').trim().chars().take(128).collect()
+}
+
+fn truncate_error(error: &str) -> String {
+    error.chars().take(1_000).collect()
+}
+
+fn now_unix_ms() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_metadata_text, truncate_error};
+
+    #[test]
+    fn metadata_text_is_trimmed_and_bounded() {
+        let value = format!("  USDT\0{}  ", "x".repeat(200));
+        let sanitized = sanitize_metadata_text(&value);
+        assert!(sanitized.starts_with("USDT"));
+        assert!(sanitized.chars().count() <= 128);
+    }
+
+    #[test]
+    fn job_errors_are_bounded() {
+        assert_eq!(truncate_error(&"x".repeat(2_000)).len(), 1_000);
+    }
 }

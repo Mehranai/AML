@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import random
@@ -97,8 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--validation-ratio", type=float, default=0.2)
+    parser.add_argument("--validation-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--minimum-test-samples", type=int, default=200)
+    parser.add_argument("--minimum-test-auc", type=float, default=0.70)
+    parser.add_argument("--maximum-test-brier", type=float, default=0.25)
     parser.add_argument(
         "--activate",
         action="store_true",
@@ -129,6 +134,7 @@ def read_training_csv(path: Path) -> Dataset:
     addresses: list[str] = []
     feature_rows: list[list[float]] = []
     labels: list[float] = []
+    seen_addresses: set[str] = set()
 
     with path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -143,21 +149,41 @@ def read_training_csv(path: Path) -> Dataset:
 
         for row_number, row in enumerate(reader, start=2):
             try:
-                feature_rows.append(
-                    [
-                        float(row.get(feature, "").strip() or "0")
-                        for feature in FEATURE_NAMES
-                    ]
-                )
+                address = (row.get("address") or "").strip()
+                if not address:
+                    raise ValueError("address is required")
+                normalized_address = address.lower()
+                if normalized_address in seen_addresses:
+                    raise ValueError(
+                        "duplicate address; one wallet must produce one training sample"
+                    )
+
+                feature_values = []
+                for feature in FEATURE_NAMES:
+                    raw_value = (row.get(feature) or "").strip()
+                    if not raw_value:
+                        raise ValueError(f"feature {feature!r} is empty")
+                    value = float(raw_value)
+                    if not math.isfinite(value):
+                        raise ValueError(f"feature {feature!r} is not finite")
+                    feature_values.append(value)
+
+                seen_addresses.add(normalized_address)
+                feature_rows.append(feature_values)
                 labels.append(parse_label(row["label"]))
-                addresses.append(row.get("address", f"row_{row_number}"))
+                addresses.append(address)
             except Exception as exc:
                 raise ValueError(f"invalid training row {row_number}: {exc}") from exc
 
-    if len(labels) < 4:
-        raise ValueError("at least four labeled rows are required")
+    if len(labels) < 6:
+        raise ValueError("at least six unique labeled wallets are required")
     if len(set(labels)) != 2:
         raise ValueError("training data must include both label 1 and label 0")
+    label_counts = {label: labels.count(label) for label in set(labels)}
+    if any(count < 3 for count in label_counts.values()):
+        raise ValueError(
+            "each class needs at least three wallets for train/validation/test splits"
+        )
 
     return Dataset(
         addresses=addresses,
@@ -166,19 +192,55 @@ def read_training_csv(path: Path) -> Dataset:
     )
 
 
-def split_dataset(dataset: Dataset, validation_ratio: float, seed: int) -> tuple[Dataset, Dataset]:
-    validation_ratio = min(max(validation_ratio, 0.05), 0.5)
-    indices = list(range(len(dataset.labels)))
-    random.Random(seed).shuffle(indices)
+def split_dataset(
+    dataset: Dataset,
+    validation_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> tuple[Dataset, Dataset, Dataset]:
+    if not 0.0 < validation_ratio < 0.5:
+        raise ValueError("validation ratio must be greater than 0 and less than 0.5")
+    if not 0.0 < test_ratio < 0.5:
+        raise ValueError("test ratio must be greater than 0 and less than 0.5")
+    if validation_ratio + test_ratio >= 0.7:
+        raise ValueError("validation and test ratios leave too little training data")
 
-    validation_count = max(1, int(round(len(indices) * validation_ratio)))
-    validation_indices = indices[:validation_count]
-    train_indices = indices[validation_count:]
+    groups: dict[int, list[int]] = {0: [], 1: []}
+    for index, label in enumerate(dataset.labels.tolist()):
+        groups[int(label)].append(index)
 
-    if not train_indices:
-        raise ValueError("not enough rows after validation split")
+    train_indices: list[int] = []
+    validation_indices: list[int] = []
+    test_indices: list[int] = []
+    rng = random.Random(seed)
 
-    return take_rows(dataset, train_indices), take_rows(dataset, validation_indices)
+    for label, indices in groups.items():
+        rng.shuffle(indices)
+        if len(indices) < 3:
+            raise ValueError(f"class {label} needs at least three wallets")
+
+        validation_count = max(1, int(round(len(indices) * validation_ratio)))
+        test_count = max(1, int(round(len(indices) * test_ratio)))
+        while len(indices) - validation_count - test_count < 1:
+            if validation_count >= test_count and validation_count > 1:
+                validation_count -= 1
+            elif test_count > 1:
+                test_count -= 1
+            else:
+                raise ValueError(f"class {label} has too few wallets for three splits")
+
+        validation_indices.extend(indices[:validation_count])
+        test_indices.extend(indices[validation_count : validation_count + test_count])
+        train_indices.extend(indices[validation_count + test_count :])
+
+    rng.shuffle(train_indices)
+    rng.shuffle(validation_indices)
+    rng.shuffle(test_indices)
+    return (
+        take_rows(dataset, train_indices),
+        take_rows(dataset, validation_indices),
+        take_rows(dataset, test_indices),
+    )
 
 
 def take_rows(dataset: Dataset, indices: list[int]) -> Dataset:
@@ -204,13 +266,21 @@ def standardize(features: torch.Tensor, means: torch.Tensor, stds: torch.Tensor)
 def train_model(
     train: Dataset,
     validation: Dataset,
+    test: Dataset,
     hidden_widths: list[int],
     args: argparse.Namespace,
-) -> tuple[WalletRiskMlp, dict[str, float], torch.Tensor, torch.Tensor]:
+) -> tuple[
+    WalletRiskMlp,
+    dict[str, float],
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, float | str],
+]:
     torch.manual_seed(args.seed)
     means, stds = fit_standardizer(train.features)
     train_x = standardize(train.features, means, stds)
     validation_x = standardize(validation.features, means, stds)
+    test_x = standardize(test.features, means, stds)
 
     model = WalletRiskMlp(train_x.shape[1], hidden_widths)
     positives = train.labels.sum().item()
@@ -240,14 +310,55 @@ def train_model(
 
     model.eval()
     with torch.no_grad():
-        train_prob = torch.sigmoid(model(train_x))
-        validation_prob = torch.sigmoid(model(validation_x))
+        train_logits = model(train_x)
+        validation_logits = model(validation_x)
+        test_logits = model(test_x)
+
+    calibration = fit_platt_calibration(validation.labels, validation_logits)
+    train_prob = calibrated_probabilities(train_logits, calibration)
+    validation_prob = calibrated_probabilities(validation_logits, calibration)
+    test_prob = calibrated_probabilities(test_logits, calibration)
 
     metrics = {
         **prefix_metrics("train", classification_metrics(train.labels, train_prob)),
         **prefix_metrics("validation", classification_metrics(validation.labels, validation_prob)),
+        **prefix_metrics("test", classification_metrics(test.labels, test_prob)),
     }
-    return model, metrics, means, stds
+    return model, metrics, means, stds, calibration
+
+
+def fit_platt_calibration(
+    labels: torch.Tensor,
+    logits: torch.Tensor,
+) -> dict[str, float | str]:
+    raw_slope = torch.tensor(0.5413249, dtype=torch.float32, requires_grad=True)
+    intercept = torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+    optimizer = torch.optim.Adam([raw_slope, intercept], lr=0.03)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    detached_logits = logits.detach()
+    for _ in range(400):
+        optimizer.zero_grad(set_to_none=True)
+        slope = torch.nn.functional.softplus(raw_slope)
+        calibrated_logits = detached_logits * slope + intercept
+        loss = loss_fn(calibrated_logits, labels)
+        loss.backward()
+        optimizer.step()
+
+    return {
+        "method": "platt",
+        "slope": float(torch.nn.functional.softplus(raw_slope).detach().item()),
+        "intercept": float(intercept.detach().item()),
+    }
+
+
+def calibrated_probabilities(
+    logits: torch.Tensor,
+    calibration: dict[str, float | str],
+) -> torch.Tensor:
+    slope = float(calibration["slope"])
+    intercept = float(calibration["intercept"])
+    return torch.sigmoid(logits * slope + intercept)
 
 
 def classification_metrics(labels: torch.Tensor, probabilities: torch.Tensor) -> dict[str, float]:
@@ -288,9 +399,16 @@ def roc_auc(labels: list[float], probabilities: list[float]) -> float:
 
     pairs = sorted(zip(probabilities, labels), key=lambda item: item[0])
     rank_sum = 0.0
-    for rank, (_, label) in enumerate(pairs, start=1):
-        if label == 1.0:
-            rank_sum += rank
+    index = 0
+    while index < len(pairs):
+        end = index + 1
+        while end < len(pairs) and pairs[end][0] == pairs[index][0]:
+            end += 1
+        average_rank = ((index + 1) + end) / 2.0
+        rank_sum += average_rank * sum(
+            1 for _, label in pairs[index:end] if label == 1.0
+        )
+        index = end
 
     return (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
 
@@ -303,6 +421,7 @@ def export_artifact(
     model: WalletRiskMlp,
     means: torch.Tensor,
     stds: torch.Tensor,
+    calibration: dict[str, float | str],
     args: argparse.Namespace,
 ) -> dict:
     hidden_layers = []
@@ -324,7 +443,7 @@ def export_artifact(
         "hidden_layers": hidden_layers,
         "output_weights": tensor_to_list(model.output_layer.weight.detach().squeeze(0)),
         "output_bias": float(model.output_layer.bias.detach().squeeze(0).item()),
-        "calibration": {"method": "identity"},
+        "calibration": calibration,
         "explanation_top_k": 12,
         "training": {
             "framework": "pytorch",
@@ -345,13 +464,18 @@ def write_outputs(
     metrics: dict[str, float],
     train: Dataset,
     validation: Dataset,
+    test: Dataset,
+    dataset_sha256: str,
     args: argparse.Namespace,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     now_ms = int(time.time() * 1000)
     training_run_id = f"tron_wallet_train_{uuid.uuid4().hex}"
+    deployment_id = f"tron_wallet_deploy_{uuid.uuid4().hex}"
     status = "ACTIVE" if args.activate else "CANDIDATE"
-    model_quality_score = float(metrics.get("validation_auc", 0.5))
+    model_quality_score = float(metrics.get("test_auc", 0.5))
+    if args.activate:
+        validate_activation_gate(metrics, test, args)
 
     parameters = {
         "epochs": args.epochs,
@@ -360,7 +484,12 @@ def write_outputs(
         "weight_decay": args.weight_decay,
         "hidden_widths": parse_hidden_widths(args.hidden_widths),
         "validation_ratio": args.validation_ratio,
+        "test_ratio": args.test_ratio,
+        "minimum_test_samples": args.minimum_test_samples,
+        "minimum_test_auc": args.minimum_test_auc,
+        "maximum_test_brier": args.maximum_test_brier,
         "seed": args.seed,
+        "dataset_sha256": dataset_sha256,
     }
 
     artifact_path = output_dir / "model_artifact.json"
@@ -369,6 +498,7 @@ def write_outputs(
     register_sql_path = output_dir / "register_model.sql"
 
     artifact_json = json.dumps(artifact, indent=2, sort_keys=True)
+    artifact_sha256 = hashlib.sha256(artifact_json.encode("utf-8")).hexdigest()
     metrics_json = json.dumps(metrics, indent=2, sort_keys=True)
     parameters_json = json.dumps(parameters, indent=2, sort_keys=True)
 
@@ -396,9 +526,13 @@ def write_outputs(
             parameters_json=parameters_json,
             artifact_uri=str(artifact_path),
             training_run_id=training_run_id,
+            deployment_id=deployment_id,
             status=status,
             train=train,
             validation=validation,
+            test=test,
+            dataset_sha256=dataset_sha256,
+            artifact_sha256=artifact_sha256,
             model_quality_score=model_quality_score,
             now_ms=now_ms,
             args=args,
@@ -414,21 +548,56 @@ def write_outputs(
     print(json.dumps(metrics, indent=2, sort_keys=True))
 
 
+def validate_activation_gate(
+    metrics: dict[str, float],
+    test: Dataset,
+    args: argparse.Namespace,
+) -> None:
+    failures = []
+    if len(test.labels) < args.minimum_test_samples:
+        failures.append(
+            f"test samples {len(test.labels)} < {args.minimum_test_samples}"
+        )
+    if metrics.get("test_auc", 0.0) < args.minimum_test_auc:
+        failures.append(
+            f"test AUC {metrics.get('test_auc', 0.0):.4f} < {args.minimum_test_auc:.4f}"
+        )
+    if metrics.get("test_brier", 1.0) > args.maximum_test_brier:
+        failures.append(
+            "test Brier "
+            f"{metrics.get('test_brier', 1.0):.4f} > {args.maximum_test_brier:.4f}"
+        )
+    if failures:
+        raise ValueError(
+            "model activation gate failed: "
+            + "; ".join(failures)
+            + ". Export as CANDIDATE, improve the data/model, or explicitly adjust the gate."
+        )
+
+
 def build_register_sql(
     artifact_json: str,
     metrics_json: str,
     parameters_json: str,
     artifact_uri: str,
     training_run_id: str,
+    deployment_id: str,
     status: str,
     train: Dataset,
     validation: Dataset,
+    test: Dataset,
+    dataset_sha256: str,
+    artifact_sha256: str,
     model_quality_score: float,
     now_ms: int,
     args: argparse.Namespace,
 ) -> str:
-    positive_count = int(train.labels.sum().item() + validation.labels.sum().item())
-    total_count = len(train.labels) + len(validation.labels)
+    positive_count = int(
+        train.labels.sum().item()
+        + validation.labels.sum().item()
+        + test.labels.sum().item()
+    )
+    total_count = len(train.labels) + len(validation.labels) + len(test.labels)
     negative_count = total_count - positive_count
 
     return f"""
@@ -439,9 +608,11 @@ INSERT INTO tron_db.wallet_ml_training_runs
     model_version,
     feature_schema_version,
     training_dataset_id,
+    dataset_sha256,
     label_policy,
     train_sample_count,
     validation_sample_count,
+    test_sample_count,
     positive_label_count,
     negative_label_count,
     metrics_json,
@@ -459,9 +630,11 @@ VALUES
     {sql_string(args.model_version)},
     {sql_string(FEATURE_SCHEMA_VERSION)},
     {sql_string(args.dataset_id)},
+    {sql_string(dataset_sha256)},
     {sql_string(args.label_policy)},
     {len(train.labels)},
     {len(validation.labels)},
+    {len(test.labels)},
     {positive_count},
     {negative_count},
     {sql_string(metrics_json)},
@@ -481,6 +654,7 @@ INSERT INTO tron_db.wallet_ml_model_registry
     feature_schema_version,
     calibration_version,
     artifact_json,
+    artifact_sha256,
     metrics_json,
     training_run_id,
     training_dataset_id,
@@ -496,8 +670,9 @@ VALUES
     {sql_string(args.model_version)},
     'pytorch_mlp',
     {sql_string(FEATURE_SCHEMA_VERSION)},
-    'identity',
+    'platt_v1',
     {sql_string(artifact_json)},
+    {sql_string(artifact_sha256)},
     {sql_string(metrics_json)},
     {sql_string(training_run_id)},
     {sql_string(args.dataset_id)},
@@ -506,6 +681,41 @@ VALUES
     {sql_string(status)},
     {now_ms},
     {now_ms if status == "ACTIVE" else 0}
+);
+{build_deployment_sql(deployment_id, now_ms, args) if status == "ACTIVE" else ""}
+""".strip()
+
+
+def build_deployment_sql(
+    deployment_id: str,
+    now_ms: int,
+    args: argparse.Namespace,
+) -> str:
+    return f"""
+
+INSERT INTO tron_db.wallet_ml_model_deployments
+(
+    environment,
+    feature_schema_version,
+    deployment_id,
+    model_id,
+    model_version,
+    status,
+    deployed_by,
+    notes,
+    deployed_at_unix_ms
+)
+VALUES
+(
+    'production',
+    {sql_string(FEATURE_SCHEMA_VERSION)},
+    {sql_string(deployment_id)},
+    {sql_string(args.model_id)},
+    {sql_string(args.model_version)},
+    'ACTIVE',
+    'pytorch_training_pipeline',
+    'Passed configured activation gates',
+    {now_ms}
 );
 """.strip()
 
@@ -519,16 +729,33 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    dataset = read_training_csv(Path(args.input))
-    train, validation = split_dataset(dataset, args.validation_ratio, args.seed)
-    model, metrics, means, stds = train_model(
+    input_path = Path(args.input)
+    dataset_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    dataset = read_training_csv(input_path)
+    train, validation, test = split_dataset(
+        dataset,
+        args.validation_ratio,
+        args.test_ratio,
+        args.seed,
+    )
+    model, metrics, means, stds, calibration = train_model(
         train,
         validation,
+        test,
         parse_hidden_widths(args.hidden_widths),
         args,
     )
-    artifact = export_artifact(model, means, stds, args)
-    write_outputs(Path(args.output_dir), artifact, metrics, train, validation, args)
+    artifact = export_artifact(model, means, stds, calibration, args)
+    write_outputs(
+        Path(args.output_dir),
+        artifact,
+        metrics,
+        train,
+        validation,
+        test,
+        dataset_sha256,
+        args,
+    )
 
 
 if __name__ == "__main__":

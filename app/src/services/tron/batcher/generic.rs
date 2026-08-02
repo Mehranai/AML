@@ -15,6 +15,7 @@ where
 {
     clickhouse: Arc<Client>,
     rows: Arc<Mutex<Vec<T>>>,
+    flush_lock: Mutex<()>,
     max_batch_size: usize,
     flush_interval: Duration,
 }
@@ -32,6 +33,7 @@ where
         let batcher = Arc::new(Self {
             clickhouse,
             rows: Arc::new(Mutex::new(Vec::new())),
+            flush_lock: Mutex::new(()),
             max_batch_size,
             flush_interval,
         });
@@ -42,29 +44,31 @@ where
     }
 
     pub async fn push(&self, row: T) -> Result<()> {
-        let mut rows = self.rows.lock().await;
+        let should_flush = {
+            let mut rows = self.rows.lock().await;
+            rows.push(row);
+            rows.len() >= self.max_batch_size
+        };
 
-        rows.push(row);
-
-        if rows.len() >= self.max_batch_size {
-            let batch = rows.drain(..).collect::<Vec<_>>();
-            drop(rows);
-            self.flush(batch).await?;
+        if should_flush {
+            self.flush_pending().await
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     pub async fn flush_all(&self) -> Result<()> {
-        let batch = {
-            let mut rows = self.rows.lock().await;
-            rows.drain(..).collect::<Vec<_>>()
-        };
-
-        self.flush(batch).await
+        self.flush_pending().await
     }
 
-    async fn flush(&self, batch: Vec<T>) -> Result<()> {
+    async fn flush_pending(&self) -> Result<()> {
+        let _flush_guard = self.flush_lock.lock().await;
+
+        let batch = {
+            let rows = self.rows.lock().await;
+            rows.clone()
+        };
+
         if batch.is_empty() {
             return Ok(());
         }
@@ -79,6 +83,9 @@ where
 
         insert.end().await?;
 
+        let mut rows = self.rows.lock().await;
+        rows.drain(..batch.len());
+
         println!("[CLICKHOUSE][{}] inserted {} row(s)", T::TABLE, row_count);
 
         Ok(())
@@ -89,17 +96,7 @@ where
             loop {
                 sleep(batcher.flush_interval).await;
 
-                let batch = {
-                    let mut rows = batcher.rows.lock().await;
-
-                    if rows.is_empty() {
-                        continue;
-                    }
-
-                    rows.drain(..).collect::<Vec<_>>()
-                };
-
-                if let Err(err) = batcher.flush(batch).await {
+                if let Err(err) = batcher.flush_pending().await {
                     eprintln!("[BATCHER ERROR][{}] {:?}", T::TABLE, err);
                 }
             }

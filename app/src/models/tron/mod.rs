@@ -1,6 +1,5 @@
-pub mod address_profile;
-pub mod counterparty;
 pub mod exchange;
 pub mod exposure;
+pub mod intelligence;
 pub mod modules;
 pub mod relationship;

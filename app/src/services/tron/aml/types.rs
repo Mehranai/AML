@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use clickhouse::types::UInt256;
+
 pub const ZERO_ADDRESS: &str = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb";
 
 #[derive(Debug, Clone)]
@@ -8,13 +10,7 @@ pub struct SimpleTransfer {
     pub from: String,
     pub to: String,
     pub amount: u128,
-}
-
-#[derive(Debug, Clone)]
-pub struct NetFlow {
-    pub address: String,
-    pub token: String,
-    pub delta: i128,
+    pub raw_amount: UInt256,
 }
 
 #[derive(Debug, Clone)]

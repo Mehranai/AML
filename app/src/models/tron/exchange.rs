@@ -1,13 +1,6 @@
 use clickhouse::Row;
-use serde::Serialize;
-
-#[derive(Debug, Clone, Row, Serialize)]
-pub struct ExchangeEntityRow {
-    pub entity_id: String,
-    pub exchange_name: String,
-    pub exchange_type: String,
-    pub confidence: f32,
-}
+use clickhouse::types::UInt256;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Row, Serialize)]
 pub struct AddressEntityRow {
@@ -17,9 +10,10 @@ pub struct AddressEntityRow {
     pub entity_type: String,
     pub confidence: f32,
     pub source: String,
+    pub is_active: u8,
 }
 
-#[derive(Debug, Clone, Row, Serialize)]
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct ExchangeAddressRow {
     pub address: String,
     pub entity_id: String,
@@ -29,31 +23,12 @@ pub struct ExchangeAddressRow {
     pub detection_source: String,
     pub first_seen_block: u64,
     pub last_seen_block: u64,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-pub struct ExchangeDepositAddressRow {
-    pub address: String,
-    pub exchange_name: String,
-    pub hot_wallet: String,
-    pub confidence: f32,
-    pub detection_method: String,
-    pub first_seen_block: u64,
-    pub last_seen_block: u64,
-}
-
-#[derive(Debug, Clone, Row, Serialize)]
-pub struct ExchangeClusterRow {
-    pub cluster_id: String,
-    pub exchange_name: String,
-    pub address: String,
-    pub role: String,
-    pub confidence: f32,
-    pub discovered_from: String,
+    pub is_active: u8,
 }
 
 #[derive(Debug, Clone, Row, Serialize)]
 pub struct ExchangeFlowRow {
+    pub flow_id: String,
     pub tx_hash: String,
     pub block_number: u64,
     pub from_address: String,
@@ -61,6 +36,6 @@ pub struct ExchangeFlowRow {
     pub exchange_name: String,
     pub flow_type: String,
     pub token_address: String,
-    pub amount: u128,
+    pub amount: UInt256,
     pub confidence: f32,
 }

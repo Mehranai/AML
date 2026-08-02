@@ -10,10 +10,10 @@ pub struct SyncStateRow {
 pub async fn get_last_synced_block(client: &Client, chain: &str) -> anyhow::Result<Option<u64>> {
     let row = client
         .query(
-            "SELECT chain, last_synced_block
+            "SELECT chain, argMax(last_synced_block, updated_at) AS last_synced_block
              FROM sync_state
              WHERE chain = ?
-             LIMIT 1",
+             GROUP BY chain",
         )
         .bind(chain)
         .fetch_optional::<SyncStateRow>()

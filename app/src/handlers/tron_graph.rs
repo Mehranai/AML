@@ -23,11 +23,32 @@ pub async fn tron_wallet_graph(
     let config = AppConfig::from_env();
     let address = normalize_wallet_address(&address)?;
     let clickhouse = clickhouse_client(&config);
+
+    let graph = build_wallet_flow_graph(
+        clickhouse,
+        None,
+        &address,
+        params.depth.unwrap_or(3),
+        params.limit.unwrap_or(500),
+    )
+    .await
+    .map_err(TronApiError::internal)?;
+
+    Ok(Json(graph))
+}
+
+pub async fn tron_wallet_graph_import(
+    Path(address): Path<String>,
+    Query(params): Query<WalletGraphQuery>,
+) -> Result<Json<WalletFlowGraph>, TronApiError> {
+    let config = AppConfig::from_env();
+    let address = normalize_wallet_address(&address)?;
+    let clickhouse = clickhouse_client(&config);
     let neo4j = neo4j_client(&config).await?;
 
     let graph = build_wallet_flow_graph(
         clickhouse,
-        &neo4j,
+        Some(&neo4j),
         &address,
         params.depth.unwrap_or(3),
         params.limit.unwrap_or(500),

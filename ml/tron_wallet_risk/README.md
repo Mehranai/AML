@@ -19,7 +19,7 @@ cd D:\Sarbazi\dockerizd_eth_code
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r ml\tron_wallet_risk\requirements.txt
-python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\sample_training_data.csv --output-dir ml\tron_wallet_risk\artifacts\smoke --activate
+python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\sample_training_data.csv --output-dir ml\tron_wallet_risk\artifacts\smoke
 ```
 
 The script writes:
@@ -31,7 +31,8 @@ feature_schema.json
 register_model.sql
 ```
 
-Run `register_model.sql` against ClickHouse to make the model ACTIVE.
+The smoke dataset is too small to pass the production activation gate. Its
+generated SQL registers a `CANDIDATE`.
 
 ## Export From ClickHouse
 
@@ -45,7 +46,7 @@ clickhouse-client --query "$(Get-Content ml\tron_wallet_risk\export_training_dat
 Then train:
 
 ```powershell
-python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\training.csv --output-dir ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1 --activate
+python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\training.csv --output-dir ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1
 ```
 
 ## Build Training CSV From Labeled Addresses
@@ -84,11 +85,21 @@ The API will build the wallet fingerprint, exposure features, and persist a
 feature snapshot. Even if there is no ACTIVE model yet, it still returns the
 features needed for training.
 
-Then train:
+Then train and review a candidate:
+
+```powershell
+python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\training.csv --output-dir ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1
+```
+
+For a real dataset, activate only after reviewing the held-out test metrics:
 
 ```powershell
 python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\training.csv --output-dir ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1 --activate
 ```
+
+Activation defaults require at least 200 held-out test wallets, test AUC of at
+least 0.70, and test Brier score no greater than 0.25. The generated SQL stores
+the checksummed artifact and updates the production deployment pointer.
 
 Run the generated SQL against ClickHouse:
 
@@ -98,7 +109,10 @@ ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1\register_model.sql
 
 ## Training Data Format
 
-Training data is a CSV with one row per labeled wallet snapshot.
+Training data is a CSV with exactly one row per unique labeled wallet snapshot.
+Duplicate addresses, missing values, and non-finite values are rejected.
+Generated CSVs also retain the feature snapshot id, schema version, generation
+time, and available label provenance so a training run can be reproduced.
 
 Required columns:
 
@@ -168,3 +182,9 @@ merchant or operational wallets with benign history
 The feature snapshot should be generated from data available before or at the
 label decision time. Do not include future transactions that happened after the
 wallet was labeled, or the model will learn from leaked future information.
+
+The trainer uses label-stratified train/validation/test partitions. The model is
+fit on training data, Platt calibration is fit on validation logits, and final
+metrics are measured on the untouched test set. For production evaluation,
+partition related wallets by entity/case/cluster and use time-based holdouts as
+well; address-only random splitting can leak related behavior across partitions.

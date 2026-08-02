@@ -133,6 +133,11 @@ impl TronClient {
         self.post("wallet/getnowblock", serde_json::json!({})).await
     }
 
+    pub async fn get_now_solid_block(&self) -> Result<Value> {
+        self.post("walletsolidity/getnowblock", serde_json::json!({}))
+            .await
+    }
+
     pub async fn get_tx_receipt(&self, tx_hash: &str) -> Result<Value> {
         self.post(
             "wallet/gettransactioninfobyid",
@@ -158,6 +163,14 @@ impl TronClient {
         block["block_header"]["raw_data"]["number"]
             .as_u64()
             .ok_or_else(|| anyhow!("Failed to parse block number"))
+    }
+
+    pub async fn get_solid_block_number(&self) -> Result<u64> {
+        let block = self.get_now_solid_block().await?;
+
+        block["block_header"]["raw_data"]["number"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Failed to parse solid block number"))
     }
 }
 

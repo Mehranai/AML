@@ -1,4 +1,4 @@
-use std::{env, str::FromStr};
+use std::{collections::HashMap, env, fs, path::Path, str::FromStr, sync::OnceLock};
 
 #[derive(Debug, Clone)]
 pub enum AppMode {
@@ -67,6 +67,12 @@ pub struct AppConfig {
     pub total_eth_txs: u64,
     pub total_bsc_txs: u64,
     pub total_tron_txs: u64,
+    pub tron_poll_interval_seconds: u64,
+    pub tron_metadata_poll_interval_seconds: u64,
+    pub tron_metadata_batch_size: u64,
+    pub tron_metadata_max_attempts: u8,
+    pub tron_ingestion_batch_max_rows: usize,
+    pub tron_ingestion_flush_interval_seconds: u64,
 
     pub rpc_timeout_seconds: u64,
     pub rpc_max_concurrency: usize,
@@ -78,7 +84,6 @@ pub struct AppConfig {
 
     pub eth_allow_destructive_schema_cleanup: bool,
     pub tron_allow_destructive_schema_cleanup: bool,
-    pub tron_ai_risk_enabled: bool,
 }
 
 impl AppConfig {
@@ -122,6 +127,18 @@ impl AppConfig {
             total_eth_txs: env_parse("TOTAL_ETH_TXS", 500),
             total_bsc_txs: env_parse("TOTAL_BSC_TXS", 500),
             total_tron_txs: env_parse("TOTAL_TRON_TXS", 200),
+            tron_poll_interval_seconds: env_parse("TRON_POLL_INTERVAL_SECONDS", 3),
+            tron_metadata_poll_interval_seconds: env_parse(
+                "TRON_METADATA_POLL_INTERVAL_SECONDS",
+                5,
+            ),
+            tron_metadata_batch_size: env_parse("TRON_METADATA_BATCH_SIZE", 100),
+            tron_metadata_max_attempts: env_parse("TRON_METADATA_MAX_ATTEMPTS", 5),
+            tron_ingestion_batch_max_rows: env_parse("TRON_INGESTION_BATCH_MAX_ROWS", 10_000),
+            tron_ingestion_flush_interval_seconds: env_parse(
+                "TRON_INGESTION_FLUSH_INTERVAL_SECONDS",
+                120,
+            ),
 
             rpc_timeout_seconds: env_parse("RPC_TIMEOUT_SECONDS", 120),
             rpc_max_concurrency: env_parse("RPC_MAX_CONCURRENCY", 2),
@@ -139,7 +156,6 @@ impl AppConfig {
                 "TRON_ALLOW_DESTRUCTIVE_SCHEMA_CLEANUP",
                 false,
             ),
-            tron_ai_risk_enabled: env_bool("TRON_AI_RISK_ENABLED", false),
         }
     }
 }
@@ -161,6 +177,59 @@ fn env_optional(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            local_env()
+                .get(key)
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn local_env() -> &'static HashMap<String, String> {
+    static LOCAL_ENV: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+    LOCAL_ENV.get_or_init(|| {
+        [Path::new(".env"), Path::new("app/.env")]
+            .into_iter()
+            .find_map(|path| fs::read_to_string(path).ok())
+            .map(|contents| parse_env_file(&contents))
+            .unwrap_or_default()
+    })
+}
+
+fn parse_env_file(contents: &str) -> HashMap<String, String> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+
+            let line = line.strip_prefix("export ").unwrap_or(line).trim();
+            let (key, raw_value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
+            {
+                return None;
+            }
+
+            let raw_value = raw_value.trim();
+            let value = if raw_value.len() >= 2
+                && ((raw_value.starts_with('"') && raw_value.ends_with('"'))
+                    || (raw_value.starts_with('\'') && raw_value.ends_with('\'')))
+            {
+                &raw_value[1..raw_value.len() - 1]
+            } else {
+                raw_value
+            };
+
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 fn env_parse<T>(key: &str, default: T) -> T
@@ -181,4 +250,31 @@ fn env_bool(key: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env_file;
+
+    #[test]
+    fn parses_local_env_without_overwriting_rules() {
+        let values = parse_env_file(
+            r#"
+            # local configuration
+            TRON_API_KEY="secret-value"
+            export NEO4J_PASSWORD='password'
+            INVALID-KEY=ignored
+            "#,
+        );
+
+        assert_eq!(
+            values.get("TRON_API_KEY").map(String::as_str),
+            Some("secret-value")
+        );
+        assert_eq!(
+            values.get("NEO4J_PASSWORD").map(String::as_str),
+            Some("password")
+        );
+        assert!(!values.contains_key("INVALID-KEY"));
+    }
 }

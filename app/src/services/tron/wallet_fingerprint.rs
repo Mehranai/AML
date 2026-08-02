@@ -15,14 +15,13 @@ pub struct WalletFingerprint {
     pub fingerprint_label: String,
     pub wallet_type: String,
     pub confidence: f32,
-    pub risk_score: f32,
     pub identity: WalletIdentity,
     pub flows: WalletFlowSummary,
     pub behavior: WalletBehaviorSummary,
     pub dominant_tokens: Vec<TokenUsage>,
     pub senders: Vec<WalletCounterpartyFingerprint>,
     pub receivers: Vec<WalletCounterpartyFingerprint>,
-    pub risk_flags: Vec<String>,
+    pub behavior_flags: Vec<String>,
     pub evidence: Vec<String>,
     pub generated_at_unix_ms: u64,
 }
@@ -51,9 +50,6 @@ pub struct WalletFlowSummary {
     pub unique_receivers: u64,
     pub total_volume_in_raw: String,
     pub total_volume_out_raw: String,
-    pub avg_tx_risk_score: f32,
-    pub max_tx_risk_score: u8,
-    pub high_risk_transfers: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,8 +91,6 @@ pub struct WalletCounterpartyFingerprint {
     pub last_seen_timestamp: u64,
     pub tokens: Vec<String>,
     pub dominant_token: Option<String>,
-    pub avg_risk_score: f32,
-    pub max_risk_score: u8,
     pub share_of_wallet_transfers: f32,
 }
 
@@ -108,12 +102,26 @@ struct WalletEventRow {
     counterparty: String,
     token_address: String,
     amount_raw: String,
-    risk_score: u8,
-    is_swap: u8,
-    is_bridge: u8,
-    is_contract_call: u8,
-    touches_exchange: u8,
-    counterparty_exchange_confidence: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
+struct WalletAggregateRow {
+    total_transfers: u64,
+    unique_transactions: u64,
+    incoming_transfers: u64,
+    outgoing_transfers: u64,
+    unique_senders: u64,
+    unique_receivers: u64,
+    total_volume_in_raw: String,
+    total_volume_out_raw: String,
+    first_seen_timestamp: u64,
+    last_seen_timestamp: u64,
+    active_days: u64,
+    token_diversity: u64,
+    swap_transfers: u64,
+    bridge_transfers: u64,
+    contract_call_transfers: u64,
+    exchange_transfers: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
@@ -142,14 +150,6 @@ struct ContractIdentityRow {
     contract_type: String,
 }
 
-#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
-struct ProfileIdentityRow {
-    probable_exchange: u8,
-    probable_deposit_wallet: u8,
-    probable_sweeper: u8,
-    risk_score: f32,
-}
-
 #[derive(Debug, Clone)]
 struct CounterpartyAggregate {
     address: String,
@@ -161,8 +161,6 @@ struct CounterpartyAggregate {
     last_seen_timestamp: u64,
     tokens: BTreeSet<String>,
     token_counts: BTreeMap<String, u64>,
-    risk_sum: u64,
-    max_risk_score: u8,
 }
 
 pub async fn build_wallet_fingerprint(
@@ -180,9 +178,10 @@ pub async fn build_wallet_fingerprint(
         generated_at_unix_ms.saturating_sub(u64::from(window_days) * 24 * 60 * 60 * 1_000);
 
     let identity = load_wallet_identity(&clickhouse, address).await?;
+    let aggregate = load_wallet_aggregate(&clickhouse, address, window_start_ms).await?;
     let events =
         load_wallet_events(&clickhouse, address, window_start_ms, sampled_event_limit).await?;
-    let is_truncated = events.len() as u64 == sampled_event_limit;
+    let is_truncated = aggregate.total_transfers > events.len() as u64;
 
     if events.is_empty() {
         return Ok(empty_fingerprint(
@@ -194,8 +193,8 @@ pub async fn build_wallet_fingerprint(
         ));
     }
 
-    let flows = build_flow_summary(&events);
-    let behavior = build_behavior_summary(&events, &flows);
+    let flows = build_flow_summary(&aggregate);
+    let behavior = build_behavior_summary(&events, &flows, &aggregate);
     let dominant_tokens = build_token_usage(&events);
 
     let counterparties = build_counterparty_aggregates(&events);
@@ -222,8 +221,7 @@ pub async fn build_wallet_fingerprint(
 
     let (wallet_type, fingerprint_label, confidence, evidence) =
         classify_wallet(&identity, &flows, &behavior);
-    let risk_score = wallet_risk_score(&flows, &behavior);
-    let risk_flags = build_risk_flags(&flows, &behavior, risk_score);
+    let behavior_flags = build_behavior_flags(&flows, &behavior);
 
     Ok(WalletFingerprint {
         address: address.to_string(),
@@ -233,17 +231,125 @@ pub async fn build_wallet_fingerprint(
         fingerprint_label,
         wallet_type,
         confidence,
-        risk_score,
         identity,
         flows,
         behavior,
         dominant_tokens,
         senders,
         receivers,
-        risk_flags,
+        behavior_flags,
         evidence,
         generated_at_unix_ms,
     })
+}
+
+async fn load_wallet_aggregate(
+    clickhouse: &Client,
+    address: &str,
+    window_start_ms: u64,
+) -> anyhow::Result<WalletAggregateRow> {
+    clickhouse
+        .query(
+            r#"
+            SELECT
+                count() AS total_transfers,
+                uniqExact(ar.tx_hash) AS unique_transactions,
+                countIf(ar.to_address = ?) AS incoming_transfers,
+                countIf(ar.from_address = ?) AS outgoing_transfers,
+                uniqExactIf(ar.from_address, ar.to_address = ?) AS unique_senders,
+                uniqExactIf(ar.to_address, ar.from_address = ?) AS unique_receivers,
+                toString(sumIf(ar.amount, ar.to_address = ?)) AS total_volume_in_raw,
+                toString(sumIf(ar.amount, ar.from_address = ?)) AS total_volume_out_raw,
+                minOrNull(ar.timestamp) AS first_seen_timestamp_nullable,
+                maxOrNull(ar.timestamp) AS last_seen_timestamp_nullable,
+                uniqExact(intDiv(ar.timestamp, 86400000)) AS active_days,
+                uniqExact(ar.token_address) AS token_diversity,
+                countIf(ifNull(tf.is_swap, toUInt8(0)) > 0) AS swap_transfers,
+                countIf(ifNull(tf.is_bridge, toUInt8(0)) > 0) AS bridge_transfers,
+                countIf(ifNull(tf.is_contract_call, toUInt8(0)) > 0) AS contract_call_transfers,
+                countIf(ifNull(ex.confidence, toFloat32(0)) > 0) AS exchange_transfers
+            FROM address_relationships_canonical AS ar
+            LEFT JOIN
+            (
+                SELECT
+                    tx_hash,
+                    max(is_swap) AS is_swap,
+                    max(is_bridge) AS is_bridge,
+                    max(is_contract_call) AS is_contract_call
+                FROM transaction_features
+                GROUP BY tx_hash
+            ) AS tf ON tf.tx_hash = ar.tx_hash
+            LEFT JOIN
+            (
+                SELECT
+                    address,
+                    max(confidence) AS confidence
+                FROM exchange_addresses FINAL
+                WHERE is_active = 1
+                GROUP BY address
+            ) AS ex
+                ON ex.address = if(ar.from_address = ?, ar.to_address, ar.from_address)
+            WHERE (ar.from_address = ? OR ar.to_address = ?)
+              AND ar.timestamp >= ?
+            "#,
+        )
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(window_start_ms)
+        .fetch_one::<WalletAggregateNullableRow>()
+        .await
+        .map(WalletAggregateRow::from)
+        .context("failed to load full-window TRON wallet aggregates")
+}
+
+#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
+struct WalletAggregateNullableRow {
+    total_transfers: u64,
+    unique_transactions: u64,
+    incoming_transfers: u64,
+    outgoing_transfers: u64,
+    unique_senders: u64,
+    unique_receivers: u64,
+    total_volume_in_raw: String,
+    total_volume_out_raw: String,
+    first_seen_timestamp_nullable: Option<u64>,
+    last_seen_timestamp_nullable: Option<u64>,
+    active_days: u64,
+    token_diversity: u64,
+    swap_transfers: u64,
+    bridge_transfers: u64,
+    contract_call_transfers: u64,
+    exchange_transfers: u64,
+}
+
+impl From<WalletAggregateNullableRow> for WalletAggregateRow {
+    fn from(row: WalletAggregateNullableRow) -> Self {
+        Self {
+            total_transfers: row.total_transfers,
+            unique_transactions: row.unique_transactions,
+            incoming_transfers: row.incoming_transfers,
+            outgoing_transfers: row.outgoing_transfers,
+            unique_senders: row.unique_senders,
+            unique_receivers: row.unique_receivers,
+            total_volume_in_raw: row.total_volume_in_raw,
+            total_volume_out_raw: row.total_volume_out_raw,
+            first_seen_timestamp: row.first_seen_timestamp_nullable.unwrap_or_default(),
+            last_seen_timestamp: row.last_seen_timestamp_nullable.unwrap_or_default(),
+            active_days: row.active_days,
+            token_diversity: row.token_diversity,
+            swap_transfers: row.swap_transfers,
+            bridge_transfers: row.bridge_transfers,
+            contract_call_transfers: row.contract_call_transfers,
+            exchange_transfers: row.exchange_transfers,
+        }
+    }
 }
 
 async fn load_wallet_events(
@@ -261,54 +367,14 @@ async fn load_wallet_events(
                 if(ar.from_address = ?, 'out', 'in') AS direction,
                 if(ar.from_address = ?, ar.to_address, ar.from_address) AS counterparty,
                 ar.token_address AS token_address,
-                toString(ar.amount) AS amount_raw,
-                ifNull(tr.risk_score, ar.risk_score) AS risk_score,
-                ifNull(tf.is_swap, toUInt8(0)) AS is_swap,
-                ifNull(tf.is_bridge, toUInt8(0)) AS is_bridge,
-                ifNull(tf.is_contract_call, toUInt8(0)) AS is_contract_call,
-                ifNull(tr.touches_exchange, toUInt8(0)) AS touches_exchange,
-                ifNull(ex.confidence, toFloat32(0)) AS counterparty_exchange_confidence
-            FROM address_relationships AS ar
-            LEFT JOIN
-            (
-                SELECT
-                    tx_hash,
-                    max(is_swap) AS is_swap,
-                    max(is_bridge) AS is_bridge,
-                    max(is_contract_call) AS is_contract_call
-                FROM transaction_features
-                GROUP BY tx_hash
-            ) AS tf ON tf.tx_hash = ar.tx_hash
-            LEFT JOIN
-            (
-                SELECT
-                    tx_hash,
-                    max(risk_score) AS risk_score,
-                    max(touches_exchange) AS touches_exchange
-                FROM transaction_risk
-                GROUP BY tx_hash
-            ) AS tr ON tr.tx_hash = ar.tx_hash
-            LEFT JOIN
-            (
-                SELECT
-                    address,
-                    max(confidence) AS confidence
-                FROM
-                (
-                    SELECT address, confidence FROM exchange_addresses
-                    UNION ALL
-                    SELECT address, confidence FROM exchange_deposit_addresses
-                )
-                GROUP BY address
-            ) AS ex
-                ON ex.address = if(ar.from_address = ?, ar.to_address, ar.from_address)
+                toString(ar.amount) AS amount_raw
+            FROM address_relationships_canonical AS ar
             WHERE (ar.from_address = ? OR ar.to_address = ?)
               AND ar.timestamp >= ?
             ORDER BY ar.timestamp DESC
             LIMIT ?
             "#,
         )
-        .bind(address)
         .bind(address)
         .bind(address)
         .bind(address)
@@ -334,12 +400,6 @@ async fn load_wallet_identity(
 
     if let Some(contract) = load_contract_identity(clickhouse, address).await? {
         return Ok(contract_identity(address, contract));
-    }
-
-    if let Some(profile) = load_profile_identity(clickhouse, address).await?
-        && let Some(identity) = profile_identity(address, profile)
-    {
-        return Ok(identity);
     }
 
     Ok(WalletIdentity {
@@ -379,24 +439,13 @@ async fn load_exchange_identity(
                     confidence,
                     detection_source AS source,
                     last_seen_block
-                FROM exchange_addresses
-                WHERE address = ?
-                UNION ALL
-                SELECT
-                    '' AS entity_id,
-                    exchange_name,
-                    'DEPOSIT' AS role,
-                    confidence,
-                    detection_method AS source,
-                    last_seen_block
-                FROM exchange_deposit_addresses
-                WHERE address = ?
+                FROM exchange_addresses FINAL
+                WHERE address = ? AND is_active = 1
             )
             ORDER BY confidence DESC, last_seen_block DESC
             LIMIT 1
             "#,
         )
-        .bind(address)
         .bind(address)
         .fetch_optional::<ExchangeIdentityRow>()
         .await
@@ -416,8 +465,9 @@ async fn load_entity_identity(
                 entity_type,
                 confidence,
                 source
-            FROM address_entity
+            FROM address_entity FINAL
             WHERE address = ?
+              AND is_active = 1
             ORDER BY confidence DESC, created_at DESC
             LIMIT 1
             "#,
@@ -448,30 +498,6 @@ async fn load_contract_identity(
         .fetch_optional::<ContractIdentityRow>()
         .await
         .context("failed to load TRON contract identity")
-}
-
-async fn load_profile_identity(
-    clickhouse: &Client,
-    address: &str,
-) -> anyhow::Result<Option<ProfileIdentityRow>> {
-    clickhouse
-        .query(
-            r#"
-            SELECT
-                probable_exchange,
-                probable_deposit_wallet,
-                probable_sweeper,
-                risk_score
-            FROM address_profiles
-            WHERE address = ?
-            ORDER BY updated_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(address)
-        .fetch_optional::<ProfileIdentityRow>()
-        .await
-        .context("failed to load TRON address profile identity")
 }
 
 fn exchange_identity(address: &str, row: ExchangeIdentityRow) -> WalletIdentity {
@@ -542,95 +568,27 @@ fn contract_identity(address: &str, row: ContractIdentityRow) -> WalletIdentity 
     }
 }
 
-fn profile_identity(address: &str, row: ProfileIdentityRow) -> Option<WalletIdentity> {
-    let (identity_type, tag) = if row.probable_exchange == 1 {
-        ("probable_exchange_wallet", "probable_exchange")
-    } else if row.probable_deposit_wallet == 1 {
-        (
-            "probable_exchange_deposit_wallet",
-            "probable_deposit_wallet",
-        )
-    } else if row.probable_sweeper == 1 {
-        ("probable_sweeper_wallet", "probable_sweeper")
-    } else {
-        return None;
-    };
-
-    Some(WalletIdentity {
-        address: address.to_string(),
-        identity_type: identity_type.to_string(),
-        entity_id: None,
-        entity_name: None,
-        entity_type: Some("behavioral_cluster".to_string()),
-        exchange_name: None,
-        exchange_role: None,
-        confidence: row.risk_score.clamp(0.35, 0.85),
-        source: "address_profiles".to_string(),
-        tags: vec![tag.to_string()],
-    })
-}
-
-fn build_flow_summary(events: &[WalletEventRow]) -> WalletFlowSummary {
-    let mut tx_hashes = HashSet::<&str>::new();
-    let mut senders = HashSet::<&str>::new();
-    let mut receivers = HashSet::<&str>::new();
-    let mut total_volume_in = 0u128;
-    let mut total_volume_out = 0u128;
-    let mut incoming_transfers = 0u64;
-    let mut outgoing_transfers = 0u64;
-    let mut risk_sum = 0u64;
-    let mut max_tx_risk_score = 0u8;
-    let mut high_risk_transfers = 0u64;
-
-    for event in events {
-        tx_hashes.insert(event.tx_hash.as_str());
-        let amount = parse_amount(&event.amount_raw);
-        risk_sum += u64::from(event.risk_score);
-        max_tx_risk_score = max_tx_risk_score.max(event.risk_score);
-
-        if event.risk_score >= 70 {
-            high_risk_transfers += 1;
-        }
-
-        if event.direction == "in" {
-            incoming_transfers += 1;
-            total_volume_in = total_volume_in.saturating_add(amount);
-            senders.insert(event.counterparty.as_str());
-        } else {
-            outgoing_transfers += 1;
-            total_volume_out = total_volume_out.saturating_add(amount);
-            receivers.insert(event.counterparty.as_str());
-        }
-    }
-
+fn build_flow_summary(aggregate: &WalletAggregateRow) -> WalletFlowSummary {
     WalletFlowSummary {
-        total_transfers: events.len() as u64,
-        unique_transactions: tx_hashes.len() as u64,
-        incoming_transfers,
-        outgoing_transfers,
-        unique_senders: senders.len() as u64,
-        unique_receivers: receivers.len() as u64,
-        total_volume_in_raw: total_volume_in.to_string(),
-        total_volume_out_raw: total_volume_out.to_string(),
-        avg_tx_risk_score: ratio(risk_sum as f64, events.len() as f64) as f32,
-        max_tx_risk_score,
-        high_risk_transfers,
+        total_transfers: aggregate.total_transfers,
+        unique_transactions: aggregate.unique_transactions,
+        incoming_transfers: aggregate.incoming_transfers,
+        outgoing_transfers: aggregate.outgoing_transfers,
+        unique_senders: aggregate.unique_senders,
+        unique_receivers: aggregate.unique_receivers,
+        total_volume_in_raw: aggregate.total_volume_in_raw.clone(),
+        total_volume_out_raw: aggregate.total_volume_out_raw.clone(),
     }
 }
 
 fn build_behavior_summary(
     events: &[WalletEventRow],
     flows: &WalletFlowSummary,
+    aggregate: &WalletAggregateRow,
 ) -> WalletBehaviorSummary {
     let mut tx_timestamps = HashMap::<&str, u64>::new();
     let mut active_hours = BTreeSet::<u8>::new();
-    let mut active_days = BTreeSet::<u64>::new();
-    let mut tokens = HashSet::<&str>::new();
     let mut counterparty_counts = HashMap::<&str, u64>::new();
-    let mut swap_count = 0u64;
-    let mut bridge_count = 0u64;
-    let mut contract_call_count = 0u64;
-    let mut exchange_count = 0u64;
 
     for event in events {
         tx_timestamps
@@ -641,24 +599,18 @@ fn build_behavior_summary(
         if let Some(hour) = hour_from_timestamp_ms(event.timestamp) {
             active_hours.insert(hour);
         }
-        active_days.insert(event.timestamp / 86_400_000);
-        tokens.insert(event.token_address.as_str());
         *counterparty_counts
             .entry(event.counterparty.as_str())
             .or_default() += 1;
-
-        swap_count += u64::from(event.is_swap > 0);
-        bridge_count += u64::from(event.is_bridge > 0);
-        contract_call_count += u64::from(event.is_contract_call > 0);
-        exchange_count +=
-            u64::from(event.touches_exchange > 0 || event.counterparty_exchange_confidence > 0.0);
     }
 
     let mut timestamps = tx_timestamps.into_values().collect::<Vec<_>>();
     timestamps.sort_unstable();
 
-    let first_seen_timestamp = timestamps.first().copied();
-    let last_seen_timestamp = timestamps.last().copied();
+    let first_seen_timestamp =
+        (aggregate.first_seen_timestamp > 0).then_some(aggregate.first_seen_timestamp);
+    let last_seen_timestamp =
+        (aggregate.last_seen_timestamp > 0).then_some(aggregate.last_seen_timestamp);
     let observed_days = match (first_seen_timestamp, last_seen_timestamp) {
         (Some(first), Some(last)) if last > first => (last - first) as f64 / 86_400_000.0,
         (Some(_), Some(_)) => 1.0,
@@ -670,7 +622,7 @@ fn build_behavior_summary(
         first_seen_timestamp,
         last_seen_timestamp,
         observed_days,
-        active_days: active_days.len() as u64,
+        active_days: aggregate.active_days,
         active_hours: active_hours.into_iter().collect(),
         avg_tx_interval_seconds: avg_interval_seconds(&timestamps),
         burst_score: burst_score(&timestamps),
@@ -682,12 +634,23 @@ fn build_behavior_summary(
             largest_counterparty_count as f64,
             flows.total_transfers.max(1) as f64,
         ) as f32,
-        token_diversity: tokens.len() as u32,
-        contract_call_ratio: ratio(contract_call_count as f64, flows.total_transfers as f64) as f32,
-        swap_ratio: ratio(swap_count as f64, flows.total_transfers as f64) as f32,
-        bridge_ratio: ratio(bridge_count as f64, flows.total_transfers as f64) as f32,
-        exchange_interaction_ratio: ratio(exchange_count as f64, flows.total_transfers as f64)
-            as f32,
+        token_diversity: aggregate.token_diversity.min(u64::from(u32::MAX)) as u32,
+        contract_call_ratio: ratio(
+            aggregate.contract_call_transfers as f64,
+            flows.total_transfers as f64,
+        ) as f32,
+        swap_ratio: ratio(
+            aggregate.swap_transfers as f64,
+            flows.total_transfers as f64,
+        ) as f32,
+        bridge_ratio: ratio(
+            aggregate.bridge_transfers as f64,
+            flows.total_transfers as f64,
+        ) as f32,
+        exchange_interaction_ratio: ratio(
+            aggregate.exchange_transfers as f64,
+            flows.total_transfers as f64,
+        ) as f32,
     }
 }
 
@@ -752,8 +715,6 @@ fn build_counterparty_aggregates(events: &[WalletEventRow]) -> Vec<CounterpartyA
                 last_seen_timestamp: event.timestamp,
                 tokens: BTreeSet::new(),
                 token_counts: BTreeMap::new(),
-                risk_sum: 0,
-                max_risk_score: 0,
             });
 
         aggregate.transfer_count += 1;
@@ -768,8 +729,6 @@ fn build_counterparty_aggregates(events: &[WalletEventRow]) -> Vec<CounterpartyA
             .token_counts
             .entry(event.token_address.clone())
             .or_default() += 1;
-        aggregate.risk_sum += u64::from(event.risk_score);
-        aggregate.max_risk_score = aggregate.max_risk_score.max(event.risk_score);
     }
 
     let mut aggregates = aggregates.into_values().collect::<Vec<_>>();
@@ -810,9 +769,6 @@ async fn build_counterparty_fingerprints(
             last_seen_timestamp: aggregate.last_seen_timestamp,
             tokens: aggregate.tokens.iter().cloned().collect(),
             dominant_token,
-            avg_risk_score: ratio(aggregate.risk_sum as f64, aggregate.transfer_count as f64)
-                as f32,
-            max_risk_score: aggregate.max_risk_score,
             share_of_wallet_transfers: ratio(
                 aggregate.transfer_count as f64,
                 total_wallet_transfers.max(1) as f64,
@@ -964,19 +920,12 @@ fn classify_wallet(
     )
 }
 
-fn build_risk_flags(
+fn build_behavior_flags(
     flows: &WalletFlowSummary,
     behavior: &WalletBehaviorSummary,
-    risk_score: f32,
 ) -> Vec<String> {
     let mut flags = Vec::new();
 
-    if risk_score >= 0.7 {
-        flags.push("high_wallet_risk_score".to_string());
-    }
-    if flows.max_tx_risk_score >= 80 {
-        flags.push("high_risk_transaction_seen".to_string());
-    }
     if behavior.exchange_interaction_ratio >= 0.5 {
         flags.push("exchange_interaction_heavy".to_string());
     }
@@ -1000,28 +949,6 @@ fn build_risk_flags(
     }
 
     flags
-}
-
-fn wallet_risk_score(flows: &WalletFlowSummary, behavior: &WalletBehaviorSummary) -> f32 {
-    let avg_risk = flows.avg_tx_risk_score as f64 / 100.0;
-    let max_risk = f64::from(flows.max_tx_risk_score) / 100.0;
-    let high_risk_ratio = ratio(
-        flows.high_risk_transfers as f64,
-        flows.total_transfers.max(1) as f64,
-    );
-    let concentration_penalty = if behavior.counterparty_concentration >= 0.75 {
-        0.1
-    } else {
-        0.0
-    };
-
-    clamp01(
-        avg_risk * 0.45
-            + max_risk * 0.25
-            + high_risk_ratio * 0.10
-            + f64::from(behavior.burst_score) * 0.10
-            + concentration_penalty,
-    )
 }
 
 fn evidence_confidence(flows: &WalletFlowSummary, behavior: &WalletBehaviorSummary) -> f32 {
@@ -1063,7 +990,6 @@ fn empty_fingerprint(
         fingerprint_label: "No observed TRON flow history".to_string(),
         wallet_type: identity.identity_type.clone(),
         confidence: identity.confidence,
-        risk_score: 0.0,
         identity,
         flows: WalletFlowSummary {
             total_transfers: 0,
@@ -1074,9 +1000,6 @@ fn empty_fingerprint(
             unique_receivers: 0,
             total_volume_in_raw: "0".to_string(),
             total_volume_out_raw: "0".to_string(),
-            avg_tx_risk_score: 0.0,
-            max_tx_risk_score: 0,
-            high_risk_transfers: 0,
         },
         behavior: WalletBehaviorSummary {
             first_seen_timestamp: None,
@@ -1097,7 +1020,7 @@ fn empty_fingerprint(
         dominant_tokens: Vec::new(),
         senders: Vec::new(),
         receivers: Vec::new(),
-        risk_flags: Vec::new(),
+        behavior_flags: Vec::new(),
         evidence: vec!["no address_relationships rows in selected window".to_string()],
         generated_at_unix_ms,
     }
@@ -1139,7 +1062,7 @@ fn hour_from_timestamp_ms(timestamp: u64) -> Option<u8> {
 }
 
 fn parse_amount(amount_raw: &str) -> u128 {
-    amount_raw.parse::<u128>().unwrap_or_default()
+    amount_raw.parse::<u128>().unwrap_or(u128::MAX)
 }
 
 fn ratio(numerator: f64, denominator: f64) -> f64 {
@@ -1184,9 +1107,6 @@ mod tests {
             unique_receivers: 2,
             total_volume_in_raw: "1000".to_string(),
             total_volume_out_raw: "900".to_string(),
-            avg_tx_risk_score: 10.0,
-            max_tx_risk_score: 20,
-            high_risk_transfers: 0,
         };
         let behavior = WalletBehaviorSummary {
             first_seen_timestamp: Some(0),
@@ -1222,9 +1142,6 @@ mod tests {
             unique_receivers: 0,
             total_volume_in_raw: "100".to_string(),
             total_volume_out_raw: "0".to_string(),
-            avg_tx_risk_score: 0.0,
-            max_tx_risk_score: 0,
-            high_risk_transfers: 0,
         };
         let behavior = WalletBehaviorSummary {
             first_seen_timestamp: Some(0),

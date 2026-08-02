@@ -1,1166 +1,679 @@
-# TRON AML Implementation Specification
-
-This document is the master specification for the current TRON AML implementation.
-It describes how the project ingests TRON data, stores AML evidence in
-ClickHouse, builds graph and wallet-level investigation outputs, and connects the
-AI-native wallet risk model.
-
-Use this file as the implementation template for future networks such as
-Ethereum, BSC, Polygon, Solana, and other chains. The chain-specific parts should
-change per network, but the canonical data contracts, investigation response, ML
-feature lifecycle, and analyst workflow should remain consistent.
-
-## 1. Current Objective
-
-Given one wallet address, the TRON implementation must return:
-
-- Fund flow graph visualization.
-- Wallet holdings.
-- Wallet behavioral fingerprint.
-- Exposure to risky seeds and entities.
-- AI/ML laundering probability, produced from stored deterministic evidence.
-- Data quality warnings that tell the analyst whether the output is complete
-  enough to trust.
-
-The intended product shape is Chainalysis-style wallet investigation:
-
-1. Index on-chain activity.
-2. Normalize raw chain events into canonical tables.
-3. Detect semantic activity such as transfers, swaps, bridges, mint/burn events,
-   liquidity operations, and exchange interactions.
-4. Persist graph relationships and behavioral evidence.
-5. Build wallet-level features from ClickHouse.
-6. Run a trained AI model over those features.
-7. Return explainable wallet investigation output through the API and UI.
-
-## 2. Source Code Map
-
-Main runtime files:
-
-- `app/src/bin/tron_init_schema.rs`: initializes TRON ClickHouse schema.
-- `app/src/bin/tron_graph_api.rs`: runs the Axum API and dashboard.
-- `app/src/bin/tron_export_wallet_graph.rs`: exports one wallet graph into Neo4j.
-- `app/src/router.rs`: defines TRON API routes.
-- `app/src/handlers/dashboard.rs`: serves `app/web/index.html`.
-- `app/src/handlers/tron_common.rs`: shared address normalization, ClickHouse,
-  and Neo4j client helpers.
-- `app/src/handlers/tron_graph.rs`: wallet graph endpoint.
-- `app/src/handlers/tron_wallet_holdings.rs`: holdings endpoint.
-- `app/src/handlers/tron_wallet_fingerprint.rs`: fingerprint endpoint.
-- `app/src/handlers/tron_wallet_ai_risk.rs`: AI risk endpoint.
-- `app/src/handlers/tron_wallet_investigation.rs`: unified investigation endpoint.
-
-Main TRON service modules:
-
-- `app/src/services/tron/fetcher.rs`: block and transaction ingestion pipeline.
-- `app/src/services/loader.rs`: ClickHouse and TronGrid loader setup.
-- `app/src/services/tron/batcher.rs`: batched inserts into ClickHouse.
-- `app/src/services/tron/aml/*`: AML event detectors and shared event types.
-- `app/src/services/tron/tron_classifier/*`: protocol and contract classifier.
-- `app/src/services/tron/transaction_type.rs`: semantic transaction classifier.
-- `app/src/services/tron/risk_engine.rs`: transaction-level evidence scoring.
-- `app/src/services/tron/relationship_builder.rs`: canonical graph edge builder.
-- `app/src/services/tron/exchange/*`: exchange seed and heuristic attribution.
-- `app/src/services/tron/exposure/*`: exposure propagation from seed addresses.
-- `app/src/services/tron/wallet_exposure.rs`: wallet exposure summary loader.
-- `app/src/services/tron/wallet_fingerprint.rs`: wallet behavior fingerprint.
-- `app/src/services/tron/wallet_holdings.rs`: wallet holdings from derived balances.
-- `app/src/services/tron/wallet_ai_risk.rs`: ML feature snapshot, model loading,
-  inference, and prediction persistence.
-- `app/src/services/tron/wallet_investigation.rs`: unified investigation assembly.
-- `app/src/services/tron/neo4j/*`: Neo4j graph import and wallet graph response.
-
-Schema and ML files:
-
-- `app/sql/init_database_tron.sql`: active TRON AML warehouse schema.
-- `app/sql/tron_migration_20260705_0005_wallet_ml_native.sql`: ML-native wallet
-  risk tables.
-- `app/src/db/init_tron.rs`: migration runner, checksum guard, cleanup guard, and
-  holdings backfill logic.
-- `ml/tron_wallet_risk/train.py`: PyTorch tabular model trainer.
-- `ml/tron_wallet_risk/build_training_csv_from_api.py`: feature CSV builder from
-  labeled wallet addresses.
-- `ml/tron_wallet_risk/export_training_dataset.sql`: ClickHouse training export.
-- `ml/tron_wallet_risk/README.md`: ML pipeline usage notes.
-
-## 3. High-Level Architecture
-
-```mermaid
-flowchart TD
-    RPC["TRON RPC / TronGrid"] --> Fetcher["TRON fetcher"]
-    Fetcher --> Parser["Native TRX + TRC20 parser"]
-    Parser --> Raw["Raw ClickHouse tables"]
-    Parser --> Detectors["Classifiers and AML detectors"]
-    Detectors --> Evidence["Semantic evidence tables"]
-    Evidence --> Relationships["address_relationships"]
-    Relationships --> Neo4j["Neo4j graph layer"]
-    Relationships --> Exposure["Exposure propagation"]
-    Evidence --> Fingerprint["Wallet fingerprint"]
-    Raw --> Holdings["Wallet holdings view"]
-    Exposure --> Features["Wallet ML feature snapshot"]
-    Fingerprint --> Features
-    Holdings --> Investigation["Unified investigation API"]
-    Neo4j --> Investigation
-    Features --> Model["Active PyTorch model artifact"]
-    Model --> Prediction["wallet_ml_predictions"]
-    Prediction --> Investigation
-    Investigation --> UI["Dashboard / analyst workflow"]
-```
-
-The important architecture rule is separation of responsibilities:
-
-- Rust and ClickHouse collect and persist verifiable evidence.
-- Rule-like transaction semantics are stored as evidence features, not final
-  wallet laundering probability.
-- The wallet-level laundering probability is produced by the active ML model.
-- The UI and API expose evidence, model output, and data quality together.
-
-## 4. Runtime Configuration
-
-Configuration is loaded in `app/src/config.rs`.
-
-Core environment variables:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `APP_MODE` | Runtime chain mode. TRON is the default. | `tron` |
-| `SYNC_MODE` | Backfill, live, or auto sync mode. | `auto` |
-| `CLICKHOUSE_URL` | ClickHouse HTTP endpoint. | `http://localhost:8123` |
-| `CLICKHOUSE_USER` | ClickHouse user. | `admin` |
-| `CLICKHOUSE_PASSWORD` or `CLICKHOUSE_PASS` | ClickHouse password. | `mehran.admin` |
-| `CLICKHOUSE_DB_TRON` | TRON database. | `tron_db` |
-| `TRON_RPC_URL` or `TRON_RPC_HTTP` | TRON RPC endpoint. | `https://api.trongrid.io` |
-| `TRON_API_KEY` or `TRONGRID_API_KEY` | Optional TronGrid API key. | none |
-| `TRON_START_BLOCK` | Start block for ingestion. | `0` |
-| `TOTAL_TRON_TXS` | Current ingestion limit knob. | `200` |
-| `RPC_TIMEOUT_SECONDS` | RPC timeout. | `120` |
-| `RPC_MAX_CONCURRENCY` | RPC concurrency. | `2` |
-| `TX_WORKER_CONCURRENCY` | Transaction worker concurrency. | `2` |
-| `NEO4J_URI` | Neo4j Bolt endpoint. | `localhost:7687` |
-| `NEO4J_USERNAME` | Neo4j username. | `neo4j` |
-| `NEO4J_PASSWORD` | Neo4j password. | empty |
-| `TRON_GRAPH_API_ADDR` | API bind address. | `0.0.0.0:4200` |
-| `TRON_ALLOW_DESTRUCTIVE_SCHEMA_CLEANUP` | Enables dropping obsolete tables. | `false` |
-
-Operational commands:
-
-```powershell
-docker compose up -d clickhouse neo4j
-
-cd D:\Sarbazi\dockerizd_eth_code\app
-cargo run --bin tron_init_schema
-
-$env:TRON_GRAPH_API_ADDR="127.0.0.1:4001"
-cargo run --bin tron_graph_api
-```
-
-Dashboard:
-
-```text
-http://127.0.0.1:4001/
-```
-
-## 5. Schema and Migration Strategy
-
-The active schema is created by `app/sql/init_database_tron.sql`.
-
-The migration runner is `app/src/db/init_tron.rs`. It applies:
-
-1. `20260701_0001_tron_active_schema`: idempotent bootstrap schema.
-2. `20260705_0005_wallet_ml_native`: ML-native wallet risk tables.
-
-Important migration behavior:
-
-- `schema_migrations` records migration id, description, checksum, and timestamp.
-- The bootstrap schema allows checksum drift because it is idempotent and can
-  refresh active schema objects.
-- Follow-up migrations are immutable. If a checksum changes, the initializer
-  fails and a new migration must be created.
-- Destructive cleanup is disabled unless
-  `TRON_ALLOW_DESTRUCTIVE_SCHEMA_CLEANUP=true`.
-- Obsolete or redundant objects are warned about when cleanup is disabled.
-- Derived wallet balance objects can be rebuilt safely when destructive cleanup
-  is explicitly enabled.
-- If `wallet_asset_balance_deltas` is missing or empty, the initializer backfills
-  it from existing native and token transfers.
-
-Future chains should copy this pattern:
-
-- One idempotent bootstrap schema for active objects.
-- Immutable dated migrations for every later change.
-- A `schema_migrations` ledger.
-- Explicit env-gated cleanup for obsolete objects.
-- Backfill routines only for derived data that can be reconstructed.
-
-## 6. Canonical ClickHouse Data Model
-
-### 6.1 Raw Chain Data
-
-`transactions`
-
-- One row per TRON transaction.
-- Stores hash, block number, timestamp, sender, receiver, contract address,
-  contract type, amount, fee/energy/net usage, status, and memo.
-- Produced by the fetcher after parsing raw TRON transactions.
-- Consumed by graph, holdings, fingerprint, and transaction classifiers.
-
-`raw_logs`
-
-- One row per receipt log.
-- Stores transaction hash, block, log index, contract address, topics, data,
-  removed flag, and timestamp.
-- Used for TRC20 event reconstruction and future forensic inspection.
-
-`token_transfers`
-
-- One row per TRC20 Transfer event.
-- Stores token address, sender, receiver, raw amount, mint/burn flags, and event
-  signature.
-- Used for holdings, graph edges, token behavior, and wallet fingerprinting.
-
-`token_metadata`
-
-- One row per token contract.
-- Stores name, symbol, decimals, total supply, verification state, and update
-  timestamp.
-- Used to display holdings and interpret token transfers.
-
-### 6.2 Canonical Graph Data
-
-`address_relationships`
-
-- The central graph edge table.
-- Contains both raw value-transfer edges and semantic AML event edges.
-- Key columns:
-  - `relationship_id`
-  - `from_address`
-  - `to_address`
-  - `token_address`
-  - `tx_hash`
-  - `block_number`
-  - `timestamp`
-  - `amount`
-  - `transfer_type`
-  - `protocol`
-  - `event_type`
-  - `risk_score`
-  - `hop_count`
-
-Relationship types are built in `relationship_builder.rs`:
-
-- Native TRX transfer.
-- TRC20 transfer.
-- Swap.
-- Bridge in/out.
-- Liquidity add/remove.
-- Mint.
-- Burn.
-
-This table is the main portable contract for future chains. Every network should
-eventually normalize its value flow and semantic activity into an equivalent
-relationship table.
-
-### 6.3 Entity and Exchange Intelligence
-
-`address_entity`
-
-- Generic address-to-entity attribution table.
-- Used by fingerprint and graph enrichment.
-
-`exchange_entities`
-
-- Exchange entity registry.
-
-`exchange_addresses`
-
-- Exchange wallet addresses with roles such as hot wallet, deposit wallet, or
-  withdrawal wallet.
-
-`exchange_deposit_addresses`
-
-- Deposit-address attribution, usually detected by sweep behavior.
-
-`exchange_clusters`
-
-- Exchange cluster membership rows.
-
-`exchange_flows`
-
-- Transaction-level flows into or out of exchanges.
-- Used by transaction semantics, graph enrichment, and wallet fingerprinting.
-
-Exchange detection currently combines:
-
-- Hardcoded seeds in `exchange/seeds.rs`.
-- Stored exchange attribution.
-- Heuristics in `exchange/detector.rs`, such as repeated sweep behavior into an
-  exchange wallet or high fan-in/fan-out exchange-like activity.
-
-### 6.4 Contract and Semantic Transaction Evidence
-
-`contract_metadata`
-
-- Contract-level metadata and classification.
-- Stores protocol name, type, creator, creation block, bytecode hash, and
-  confidence.
-
-`transaction_features`
-
-- Semantic transaction row.
-- Stores transaction type/subtype, classification confidence/source, protocol,
-  method id, boolean flags for swap/bridge/mint/burn/liquidity/contract call,
-  token counts, participant counts, hop count, fan-in, and fan-out.
-
-`transaction_risk`
-
-- Transaction-level evidence score.
-- Stores transaction risk score/level, semantic type fields, behavior flags,
-  risk reasons, and exchange-touch flag.
-
-Important distinction:
-
-- `transaction_risk` is not the final wallet AML probability.
-- It is an evidence feature layer that helps the analyst and can feed the wallet
-  ML model.
-
-### 6.5 Holdings Model
-
-The redundant old token balance schema has been replaced by a delta-based model.
-
-`wallet_asset_balance_deltas`
-
-- Append-only balance delta table.
-- Populated by materialized views from `transactions` and `token_transfers`.
-- Stores address, asset type, asset id, signed raw delta, direction, block, tx,
-  and timestamp.
-
-Materialized views:
-
-- TRX outgoing delta.
-- TRX incoming delta.
-- TRC20 outgoing delta.
-- TRC20 incoming delta.
-
-`wallet_asset_balances`
-
-- A view over `wallet_asset_balance_deltas`.
-- Sums deltas by address and asset.
-- Joins token metadata for display.
-- Filters to positive balances.
-
-This is how the system determines what tokens a wallet holds:
-
-1. Native TRX transfers create signed TRX deltas.
-2. TRC20 Transfer events create signed token deltas.
-3. The balance view sums all deltas for a wallet and asset.
-4. The holdings API reads the view.
-
-The old redundant objects are obsolete:
-
-- `address_token_delta`
-- `address_token_balance`
-- `mv_token_balance`
-- old formula wallet risk tables
-
-### 6.6 Exposure Data
-
-`exposure_seeds`
-
-- Known risky seed addresses and entities.
-- Stores address, entity name/type, risk level, source, confidence, and creation
-  time.
-
-`address_exposure`
-
-- Persisted propagation results from seed addresses.
-- Stores source seed, exposed address, hop distance, exposure score, path count,
-  last transaction, last seen block, exposure type, and direction.
-
-Exposure propagation is implemented in `exposure/propagation.rs`:
-
-- Starts at a seed address.
-- Traverses outgoing `address_relationships`.
-- Applies hop-based decay.
-- Emits rows into `address_exposure`.
-
-Wallet exposure summaries are loaded in `wallet_exposure.rs` and used by the ML
-feature builder.
-
-### 6.7 Wallet Intelligence
-
-`address_profiles`
-
-- Aggregated wallet profile row.
-- Stores total inbound/outbound transactions, volumes, first/last seen block,
-  risk score, and updated timestamp.
-
-`address_counterparties`
-
-- Aggregated counterparty rows by address, counterparty, direction, and token.
-- Used by wallet fingerprinting.
-
-### 6.8 ML Lifecycle Tables
-
-The ML-native schema is created by
-`app/sql/tron_migration_20260705_0005_wallet_ml_native.sql`.
-
-`wallet_ml_labels`
-
-- One row per labeled wallet.
-- Current timestamp column is `created_at_unix_ms`.
-- No `valid_from_unix_ms` or `valid_to_unix_ms`.
-- Stores label, label name, typologies, confidence, source, case id, and evidence
-  references.
-
-`wallet_ml_feature_snapshots`
-
-- One row per generated wallet feature snapshot.
-- Stores address, window, feature schema version, feature names, features JSON,
-  evidence refs, and generation time.
-
-`wallet_ml_training_runs`
-
-- One row per training run.
-- Stores dataset id, label policy, train/validation counts, metrics, parameters,
-  artifact URI/JSON, status, and timestamps.
-
-`wallet_ml_model_registry`
-
-- Stores deployable model artifacts.
-- The Rust service loads the latest `ACTIVE` model for the current feature schema.
-- Supports `pytorch_mlp` artifacts and legacy logistic-compatible artifacts.
-
-`wallet_ml_predictions`
-
-- One row per scored wallet snapshot.
-- Stores model id/version/family, calibration version, risk probability, risk
-  percent, risk level, confidence, feature importance, model patterns, evidence
-  refs, and prediction time.
-
-## 7. Ingestion Pipeline
-
-The TRON ingestion pipeline lives mainly in `fetcher.rs`.
-
-### 7.1 Fetch Loop
-
-`fetch_tron`:
-
-1. Reads the starting block and sync state.
-2. Pulls blocks and transactions from TRON RPC.
-3. Applies RPC timeout and concurrency settings.
-4. Processes transactions concurrently.
-5. Batches writes through `TronBatcher`.
-6. Flushes batches and updates `sync_state`.
-
-### 7.2 Transaction Processing
-
-For each transaction, the pipeline:
-
-1. Extracts native TRX transfer details from TRON transaction contracts.
-2. Extracts receipt logs.
-3. Parses TRC20 Transfer events from logs.
-4. Saves raw transaction rows.
-5. Saves raw log rows.
-6. Saves token transfer rows.
-7. Discovers token metadata.
-8. Classifies contract/protocol behavior.
-9. Detects semantic AML events:
-   - swaps
-   - bridges
-   - mint/burn
-   - liquidity add/remove
-10. Computes transaction-level evidence score.
-11. Builds canonical `address_relationships`.
-12. Builds address profiles and counterparty summaries.
-13. Detects exchange attributions and exchange flows.
-14. Saves semantic `transaction_features`.
-15. Saves `transaction_risk`.
-
-### 7.3 Batch Inserts
-
-`app/src/services/loader.rs` creates the TRON loader with:
-
-- ClickHouse client scoped to `tron_db`.
-- Tron RPC client.
-- Batch writers for transactions, token transfers, logs, relationships,
-  transaction features, transaction risk, contract metadata, and exchange flows.
-
-Batch sizes are intentionally larger for high-volume raw data and smaller for
-semantic/intelligence data.
-
-## 8. Semantic Detection Layer
-
-The project has a deterministic semantic layer. This layer is necessary because
-raw chain data is not directly useful for AML analysis.
-
-Current semantic inputs:
-
-- Native TRX transfer contracts.
-- TRC20 Transfer logs.
-- Method id detection.
-- Contract classifier output.
-- Protocol/category registry.
-- AML event detectors.
-- Exchange attribution.
-
-Current semantic outputs:
-
-- `transaction_features`
-- `transaction_risk`
-- `address_relationships`
-- `exchange_flows`
-- `address_profiles`
-- `address_counterparties`
-
-This layer should not be removed. It is not the final AI risk model; it is the
-evidence extraction layer that makes AI training possible.
-
-Future chains need equivalent extractors:
-
-- Native coin transfer parser.
-- Token transfer parser.
-- Contract call parser.
-- Swap/bridge/liquidity/mint/burn detector.
-- Exchange and service attribution.
-- Canonical relationship builder.
-- Transaction semantic classifier.
-
-## 9. Wallet Flow Graph and Neo4j
-
-The flow graph implementation is in `services/tron/neo4j/flow_graph.rs`.
-
-Graph source:
-
-- ClickHouse `address_relationships`.
-- Entity enrichment from `exchange_addresses`, `exchange_deposit_addresses`, and
-  `address_entity`.
-
-Graph behavior:
-
-- Starts from the requested wallet.
-- Expands the relationship neighborhood breadth-first.
-- Uses `depth` and `limit` query parameters.
-- Produces graph nodes and edges for API/UI.
-- Imports wallet nodes and transfer edges into Neo4j.
-- Returns a Neo4j browser URL and a Cypher query for analyst exploration.
-
-Dedicated graph endpoint:
-
-```text
-GET /api/tron/wallet/{address}/graph?depth=3&limit=500
-POST /api/tron/wallet/{address}/neo4j/import?depth=3&limit=500
-```
-
-CLI export:
-
-```powershell
-cd D:\Sarbazi\dockerizd_eth_code\app
-cargo run --bin tron_export_wallet_graph -- <wallet> 3 500
-```
-
-Future chains should keep Neo4j as a graph visualization and traversal layer,
-while ClickHouse remains the source of truth.
-
-## 10. Wallet Holdings
-
-Holdings service:
-
-- `app/src/services/tron/wallet_holdings.rs`
-
-Endpoint:
-
-```text
-GET /api/tron/wallet/{address}/holdings?limit=50
-```
-
-Response includes:
-
-- wallet address
-- total asset count
-- returned asset count
-- native balance
-- asset list
-- metadata gap count
-- source table/view
-- generation timestamp
-
-The service reads `wallet_asset_balances`, not old balance tables.
-
-Future chains should implement holdings with a delta table plus a balance view:
-
-- It is reconstructable.
-- It avoids redundant state.
-- It supports backfills.
-- It makes cleanup safer.
-
-## 11. Wallet Behavioral Fingerprint
-
-Fingerprint service:
-
-- `app/src/services/tron/wallet_fingerprint.rs`
-
-Endpoint:
-
-```text
-GET /api/tron/wallet/{address}/fingerprint?window_days=90&top_counterparties=25&max_events=20000
-```
-
-Inputs:
-
-- `address_relationships`
-- `transaction_features`
-- `transaction_risk`
-- exchange attribution tables
-- `address_entity`
-- `contract_metadata`
-- `address_profiles`
-
-Output groups:
-
-- identity
-- flow summary
-- behavior summary
-- token usage
-- counterparty fingerprints
-- wallet type/classification
-- risk flags
-- evidence refs
-- confidence
-- truncation/data volume indicators
-
-The fingerprint is an explainable behavioral summary. It is not the final
-laundering probability.
-
-## 12. Exposure Engine
-
-Exposure is a graph-derived feature that connects a wallet to known risky seeds.
-
-Current flow:
-
-1. Insert risky seed addresses into `exposure_seeds`.
-2. Run exposure propagation from each seed.
-3. Persist results in `address_exposure`.
-4. Load wallet exposure summary in `wallet_exposure.rs`.
-5. Feed exposure features into the ML model.
-
-Exposure features currently used by the model:
-
-- `exposure_score`
-- `exposure_source_count_score`
-- `exposure_path_count_score`
-- `exposure_min_hop_score`
-
-This is a critical Chainalysis-like capability because it connects one wallet to
-known illicit or high-risk actors by graph distance and path evidence.
-
-Future work:
-
-- Add reverse exposure.
-- Add path materialization for analyst display.
-- Add time-aware exposure.
-- Weight exposure by token, amount, recency, entity type, and direction.
-- Avoid counting service wallets as direct laundering evidence unless attribution
-  supports that interpretation.
-
-## 13. AI-Native Wallet Risk Layer
-
-The wallet AI risk implementation is in:
-
-- `app/src/services/tron/wallet_ai_risk.rs`
-- `ml/tron_wallet_risk/train.py`
-- `ml/tron_wallet_risk/build_training_csv_from_api.py`
-
-The current wallet risk system is model-centered:
-
-1. Rust builds a wallet feature snapshot from ClickHouse evidence.
-2. The feature snapshot is persisted to `wallet_ml_feature_snapshots`.
-3. Rust loads the latest `ACTIVE` model from `wallet_ml_model_registry`.
-4. Rust evaluates the model artifact.
-5. Rust persists scored predictions to `wallet_ml_predictions`.
-6. The API returns probability, risk percent, risk level, confidence, feature
-   contributions, model patterns, evidence refs, and the feature snapshot.
-
-If no active trained model exists, the API returns:
-
-```text
-MODEL_NOT_TRAINED
-```
-
-Even in that state, it still returns and persists the feature snapshot. This is
-intentional because the same endpoint can be used to build training data from a
-labeled address list.
-
-### 13.1 Feature Schema
-
-Current feature schema version:
-
-```text
-tron_wallet_behavior_features_v2
-```
-
-Model input features:
-
-```text
-total_transfers_log
-unique_transactions_log
-incoming_transfers_log
-outgoing_transfers_log
-unique_senders_log
-unique_receivers_log
-fan_in_score
-fan_out_score
-flow_imbalance_score
-burst_score
-swap_ratio
-bridge_ratio
-exchange_interaction_ratio
-contract_call_ratio
-counterparty_concentration
-token_diversity_score
-exposure_score
-exposure_source_count_score
-exposure_path_count_score
-exposure_min_hop_score
-identity_confidence
-exchange_service_wallet_score
-truncated_sample_score
-data_volume_score
-```
-
-The feature schema is part of the model contract. A model in
-`wallet_ml_model_registry` must match the active feature schema, or inference
-must fail rather than silently score incompatible input.
-
-### 13.2 Training Data
-
-For labeled wallets, the trainer expects a CSV with:
-
-```text
-address,label,total_transfers_log,...,data_volume_score
-```
-
-Label meaning:
-
-```text
-1 = suspicious / laundering / illicit
-0 = clean / benign / normal
-```
-
-Recommended data generation path:
-
-1. Prepare a labeled wallet CSV:
-
-```csv
-address,label
-TWalletAddress1,1
-TWalletAddress2,0
-```
-
-2. Start the Rust API.
-
-```powershell
-cd D:\Sarbazi\dockerizd_eth_code\app
-$env:TRON_GRAPH_API_ADDR="127.0.0.1:4001"
-cargo run --bin tron_graph_api
-```
-
-3. Build a model-ready training CSV from the API:
-
-```powershell
-cd D:\Sarbazi\dockerizd_eth_code
-python ml\tron_wallet_risk\build_training_csv_from_api.py --labels ml\tron_wallet_risk\my_labeled_wallets.csv --output ml\tron_wallet_risk\training.csv --labels-sql-output ml\tron_wallet_risk\insert_labels.sql --api-base http://127.0.0.1:4001
-```
-
-4. Train a PyTorch model:
-
-```powershell
-python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\training.csv --output-dir ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1 --activate
-```
-
-5. Run the generated `register_model.sql` against ClickHouse.
-
-After registration, the AI risk endpoint will return an actual probability
-instead of `MODEL_NOT_TRAINED`.
-
-### 13.3 ClickHouse Export Path
-
-If labels and feature snapshots are already stored in ClickHouse, use:
-
-```powershell
-clickhouse-client --query "$(Get-Content ml\tron_wallet_risk\export_training_dataset.sql -Raw) FORMAT CSVWithNames" > ml\tron_wallet_risk\training.csv
-```
-
-The export joins:
-
-- latest label per wallet from `wallet_ml_labels`
-- feature snapshots from `wallet_ml_feature_snapshots`
-
-### 13.4 Model Artifact Contract
-
-The Rust service loads model artifacts from `wallet_ml_model_registry`.
-
-Required registry behavior:
-
-- `status = 'ACTIVE'`
-- `feature_schema_version = 'tron_wallet_behavior_features_v2'`
-- latest `activated_at_unix_ms` wins
-- artifact JSON must be valid for the registered `model_family`
-
-Current intended model family:
-
-```text
-pytorch_mlp
-```
-
-Model output:
-
-- `risk_probability`: float from 0.0 to 1.0
-- `risk_percent`: integer 0 to 100
-- `risk_level`: derived display level
-- `confidence`: model/output confidence signal
-
-## 14. Unified Wallet Investigation API
-
-Unified handler:
-
-- `app/src/handlers/tron_wallet_investigation.rs`
-
-Unified service:
-
-- `app/src/services/tron/wallet_investigation.rs`
-
-Endpoint:
+# TRON AML Platform Specification
+
+This is the canonical specification for the TRON implementation. It describes
+the code that exists now, the contracts between components, and the remaining
+work required for a professional AML product. Future chain implementations must
+reuse these contracts unless a chain-specific design requires a documented
+exception.
+
+The system is evidence-first:
+
+- ClickHouse is the canonical analytical warehouse.
+- Neo4j is a derived projection for traversal and visualization.
+- Deterministic code parses facts and produces reproducible behavior features.
+- Only a trained, deployed ML artifact may produce a laundering probability.
+- A probability is an investigative estimate, not a legal conclusion.
+
+## 1. Product Output
+
+The unified wallet investigation must provide:
+
+1. A fund-flow graph.
+2. Indexed TRX and TRC20 holdings.
+3. A behavioral fingerprint.
+4. Direct and propagated exposure to governed illicit seeds.
+5. An optional calibrated ML probability and confidence.
+6. Evidence references and data-quality warnings.
+7. A durable analytical snapshot that can be retrieved later.
+
+The primary endpoint is:
 
 ```text
 GET /api/tron/wallet/{address}/investigation
 ```
 
-Query parameters:
-
-| Parameter | Purpose | Default / clamp |
-| --- | --- | --- |
-| `depth` | Graph traversal depth. | default `3`, clamped `1..6` |
-| `limit` | Graph edge limit. | default `500`, clamped `1..2000` |
-| `window_days` | Fingerprint/ML window. | optional |
-| `top_counterparties` | Counterparty cap. | optional |
-| `max_events` | Fingerprint event cap. | optional |
-| `holdings_limit` | Holdings asset cap. | optional |
-
-Response shape:
+The durable analytical endpoint is:
 
 ```text
-{
-  "address": "...",
-  "graph": { ... },
-  "holdings": { ... },
-  "fingerprint": { ... },
-  "ai_risk": { ... },
-  "data_quality": { ... }
-}
+GET /api/analysis/tron/wallet/{address}
 ```
 
-`data_quality` includes:
+## 2. Current Architecture
 
-- graph depth and edge limit
-- graph node/edge counts
-- holdings count and metadata gaps
-- fingerprint event limit
-- whether fingerprinting was truncated
-- observed transfer count
-- warnings such as:
-  - `fingerprint_event_sample_truncated`
-  - `no_observed_flow_history`
-  - `low_observed_flow_volume`
-  - `graph_edge_limit_reached`
-  - `no_indexed_wallet_holdings`
-  - `token_metadata_gaps_in_holdings`
-  - `graph_depth_capped`
+```mermaid
+flowchart TD
+    RPC["TRON Full Node or TronGrid"] --> Solid["Solid block reader"]
+    Solid --> Fetcher["TRON ingestion"]
+    Fetcher --> Facts["Canonical transaction, log, and transfer facts"]
+    Fetcher --> Discovery["Token metadata discoveries"]
+    Fetcher --> Semantics["Versioned semantic AML events"]
+    Discovery --> MetadataWorker["TRC20 metadata worker"]
+    MetadataWorker --> Metadata["Token metadata"]
+    Facts --> Relationships["Canonical address relationships"]
+    Relationships --> Holdings["Replay-safe balance deltas and holdings"]
+    Relationships --> Fingerprint["Full-window behavior aggregates"]
+    Relationships --> ExposureWorker["Exposure propagation worker"]
+    Labels["Governed entity labels and illicit seeds"] --> ExposureWorker
+    ExposureWorker --> Exposure["Address exposure"]
+    Relationships --> Projection["Explicit Neo4j projection"]
+    Fingerprint --> Features["Versioned ML feature snapshot"]
+    Exposure --> Features
+    Features --> PyTorch["PyTorch training pipeline"]
+    PyTorch --> Registry["Checksummed model registry"]
+    Registry --> Deployment["Production deployment pointer"]
+    Deployment --> Inference["Rust ML inference"]
+    Inference --> Prediction["Persisted prediction"]
+    Facts --> Investigation["Unified investigation"]
+    Holdings --> Investigation
+    Fingerprint --> Investigation
+    Exposure --> Investigation
+    Prediction --> Investigation
+    Projection --> Investigation
+    Investigation --> Snapshot["Analytical wallet snapshot"]
+    Investigation --> UI["Analyst UI"]
+```
 
-Future chains should expose this same unified investigation contract. Chain
-specific sub-endpoints are useful, but the analyst UI should consume the unified
-endpoint.
+## 3. Source Map
 
-## 15. API Surface
+Runtime and schema:
 
-Current TRON routes:
+- `app/src/config.rs`: runtime configuration.
+- `app/src/db/init.rs`: SQL migration statement parser.
+- `app/src/db/init_tron.rs`: migration ledger, cleanup guard, and schema
+  validation.
+- `app/sql/init_database_tron.sql`: fresh-install bootstrap.
+- `app/sql/tron_migration_20260705_0005_wallet_ml_native.sql`: ML lifecycle
+  tables.
+- `app/sql/tron_migration_20260726_0006_analytical_node.sql`: analytical
+  snapshot tables.
+- `app/sql/tron_migration_20260729_0007_evidence_integrity.sql`: canonical
+  evidence, replay safety, finality journal, governed labels, exposure evidence,
+  ML deployment, and holdings v2.
+
+Ingestion:
+
+- `app/src/services/tron/fetcher.rs`: finalized block and transaction ingestion.
+- `app/src/helper/tron.rs`: TRON RPC client and retry/rate-limit behavior.
+- `app/src/services/tron/ingestion_state.rs`: block journal and replay checks.
+- `app/src/services/tron/batcher/generic.rs`: durable in-memory batch flush.
+- `app/src/services/tron/relationship_builder.rs`: transfer relationship facts.
+- `app/src/services/tron/semantic_event_builder.rs`: semantic event rows.
+- `app/src/services/tron/tron_metadata_worker.rs`: queued TRC20 metadata
+  enrichment.
+
+Intelligence:
+
+- `app/src/services/tron/exchange/*`: exchange attribution and exchange flows.
+- `app/src/services/tron/exposure/*`: amount-, time-, hop-, and
+  service-weighted exposure propagation.
+- `app/src/services/tron/wallet_exposure.rs`: wallet exposure summary.
+- `app/src/services/tron/wallet_fingerprint.rs`: identity and behavior
+  fingerprint.
+- `app/src/services/tron/wallet_ai_risk.rs`: feature snapshot, model loading,
+  inference, confidence, explanation, and persistence.
+- `app/src/services/tron/analytical_node.rs`: durable wallet analysis snapshot.
+
+Graph and API:
+
+- `app/src/services/tron/neo4j/*`: chain-aware Neo4j projection and path output.
+- `app/src/services/tron/wallet_investigation.rs`: unified response assembly.
+- `app/src/router.rs`: API routes.
+- `app/web/index.html`: analyst investigation UI.
+
+Workers and tools:
+
+- `app/src/bin/tron_init_schema.rs`
+- `app/src/bin/tron_token_metadata_worker.rs`
+- `app/src/bin/tron_ingest_entity_labels.rs`
+- `app/src/bin/tron_propagate_exposure.rs`
+- `app/src/bin/tron_export_wallet_graph.rs`
+- `app/src/bin/tron_graph_api.rs`
+- `ml/tron_wallet_risk/build_training_csv_from_api.py`
+- `ml/tron_wallet_risk/train.py`
+- `ml/tron_wallet_risk/export_training_dataset.sql`
+
+## 4. Canonical Warehouse Contract
+
+### 4.1 Normalized evidence
+
+`transactions`
+
+- One execution/fee summary keyed logically by `tx_hash`.
+- Stores exact `UInt256` fee fields. Address and amount fields are a primary
+  transaction summary only; graph readers do not treat them as complete
+  multi-contract transfer evidence.
+- Failed transactions remain visible with `status = 0`.
+- Failed transactions do not generate successful transfer or holdings facts.
+
+`address_relationships`
+
+- The single persisted canonical value-transfer fact.
+- Covers native TRX, TRC10, TRC20, contract call value, and successful
+  receipt-reported internal value movements.
+- Transfer IDs encode their deterministic source: contract index, event-log
+  index, or internal transaction/value index.
+- Amount is exact `UInt256`.
+- The physical fact does not repeat constant `event_type`/`hop_count` fields or
+  transaction-level protocol text. Protocol is joined from
+  `transaction_features` by the canonical view when graph output needs it.
+- Semantic actions such as swap or bridge are not represented as synthetic
+  wallets or fake transfer edges.
+- Mint/burn facts are retained for holdings, while the canonical graph view
+  excludes the zero address.
+
+`raw_logs` and `token_transfers`
+
+- Compatibility tables for pre-0008 installations.
+- Ingestion no longer writes them because the data duplicated the canonical
+  transfer fact and increased warehouse size.
+- Existing rows are retained until explicitly removed with destructive schema
+  cleanup. A local archival node is the reprocessing source when raw receipts
+  are needed.
+
+`semantic_aml_events`
+
+- Versioned detector output for swap, bridge, liquidity, mint, and burn
+  semantics.
+- Stores detector name/version, confidence, and JSON evidence.
+- Semantic events are evidence features, not wallet risk verdicts.
+
+### 4.2 Canonical read views
+
+The following views collapse replayed inserts by event identity:
+
+- `transactions_canonical`
+- `address_relationships_canonical`
+- `exchange_flows_canonical`
+
+All graph, fingerprint, exposure, and investigation readers use the canonical
+relationship view.
+
+Fresh installations use `ReplacingMergeTree` event keys. Existing append-only
+installations remain readable through canonical views until a physical
+compaction/rebuild is scheduled.
+
+### 4.3 Finality and checkpoints
+
+`ingested_blocks` records:
+
+- chain
+- block number and hash
+- parent hash
+- block timestamp
+- transaction count
+- finality and ingestion status
+
+Only TRON solid blocks are indexed. A block is marked `COMPLETE` only after all
+of its batches have been acknowledged by ClickHouse. The sync checkpoint is then
+advanced to the complete block boundary.
+
+If a previously complete solid block appears with another hash, ingestion stops
+and requires explicit reconciliation. It does not silently mix two histories.
+
+`ingestion_failures` stores one replaceable failure record per
+block/transaction/stage identity. It preserves the first failure time, latest
+failure time, attempt count, error class, retryability, and `OPEN` or `RESOLVED`
+status. A later successful completion resolves all open failures for that block.
+
+Operators can replay one finalized block or an inclusive range:
+
+```powershell
+cargo run --bin tron_replay_blocks -- <start_block> [end_block]
+```
+
+The command is capped at 10,000 blocks, requires the range to be no newer than
+the current solid head, and does not update `sync_state`. It reprocesses a
+complete block only when the observed hash matches the journaled hash. The
+legacy append-only `exchange_flows` table is replaced by deterministic
+`exchange_flows_v2` identities and the canonical view, so exchange evidence is
+also replay-safe.
+
+The generic batcher keeps rows in memory until `insert.end()` succeeds. A failed
+flush remains retryable.
+
+### 4.4 Live and backfill modes
+
+- `SYNC_MODE=backfill`: one bounded ingestion pass.
+- `SYNC_MODE=live` or `auto`: continuous finalized-head polling.
+- `TOTAL_TRON_TXS=0`: no transaction limit for a pass.
+- A positive transaction limit stops before the next block when possible.
+- The first oversized block is processed completely to preserve checkpoint
+  integrity.
+
+### 4.5 Historical performance and monitoring
+
+`tron_benchmark_ingestion` runs a bounded, non-replay historical range. Blocks
+already journaled as `COMPLETE` are skipped, preventing benchmark runs from
+creating physical duplicates in append-only facts. Each run persists one row in
+`ingestion_benchmarks` with:
+
+- source kind (`local_node` or `remote_api`)
+- requested and completed blocks
+- transaction count and elapsed time
+- block and transaction throughput
+- core table rows, compressed bytes, and active parts before/after
+- optional bounded unified-investigation latency
+- detailed metrics JSON and failure status
+
+Benchmark rows expire after 365 days. Canonical evidence has no TTL.
+
+`GET /api/tron/ingestion/health` reports:
+
+- source availability and latest solid block
+- durable checkpoint and block lag
+- processing, stale processing, and failed block counts
+- open retryable and non-retryable failures
+- exact missing block-journal ranges over a bounded window
+- core ClickHouse row, compressed-byte, and active-part totals
+
+Graph performance uses one ClickHouse relationship query per breadth-first
+frontier, enforces a global edge limit, and batch-loads entity/exchange metadata.
+The measured baseline is in `docs/tron_performance_baseline.md`.
+
+## 5. Transfer and Parser Coverage
+
+Implemented:
+
+- Every contract in a multi-contract transaction is inspected.
+- Native `TransferContract` and `TriggerSmartContract.call_value`.
+- TRC10 `TransferAssetContract` and smart-contract `call_token_value`.
+- TRC20 `Transfer(address,address,uint256)` logs.
+- Successful receipt-reported internal TRX and TRC10 value movements.
+- Exact 256-bit TRC20 amounts.
+- Successful/failed receipt handling.
+- Swap, bridge, liquidity, mint, and burn semantic detectors from observed
+  transfers.
+
+Not yet implemented:
+
+- Shielded transaction semantics.
+- Resource delegation, staking, governance, and account permission events.
+- A complete TVM call tree beyond the internal value records exposed by the
+  transaction receipt.
+
+These are evidence coverage gaps. They must be completed before claiming full
+TRON transaction coverage.
+
+## 6. Token Metadata and Holdings
+
+TRC20 discovery is separated from ingestion:
+
+1. Ingestion writes `token_metadata_discoveries`.
+2. `tron_token_metadata_worker` finds unresolved token contracts.
+3. It calls `symbol()`, `name()`, `decimals()`, and `totalSupply()` through
+   `triggerconstantcontract`.
+4. Return values are ABI-decoded, including bytes32 string fallback.
+5. Retry/failed state is recorded in `token_metadata_jobs`.
+6. Metadata failures cannot stop transfer ingestion.
+
+The worker never assumes six decimals after a failed contract call.
+
+Holdings use:
+
+- `wallet_asset_balance_deltas_v3`
+- `wallet_asset_balances`
+
+Delta identities derive from canonical transfer IDs and are replay-safe. All
+asset families use the same projection. Mint and burn zero-address legs are
+excluded from wallet balances.
+
+TRC10 balances are exact in raw units. TRC10 metadata enrichment is not yet
+implemented, so the API marks those assets as metadata-incomplete and the UI
+shows raw quantities instead of inventing a decimal precision.
+
+`balance_raw` is exact `UInt256`. `balance_decimal` is for display and can lose
+precision for very large values. `balance_incomplete = 1` means the indexed
+window began after the wallet had already acquired the asset, so outgoing
+history exceeds observed incoming history. The API must show this warning rather
+than claiming a complete balance.
+
+This is an indexed-flow balance, not an authoritative present-state RPC
+balance. A future reconciliation worker must periodically compare it with node
+state.
+
+## 7. Entity and Label Governance
+
+The intelligence layer deliberately separates named ownership from structural
+similarity. `entity_labels` contains address-to-entity claims;
+`address_cluster_claims` contains behavioral evidence that addresses belong to
+the same operational structure. A heuristic cluster cannot silently become a
+named entity attribution.
+
+`intelligence_sources` governs analyst, law-enforcement, regulatory, vendor,
+public-research, internal, and heuristic feeds. Sources have trust tiers and an
+active state. Each entity label includes:
+
+- chain and address
+- entity id, name, and type
+- confidence
+- governed source, source record id, submitter, and optional case id
+- wallet/service role and optional superseded label id
+- evidence references
+- review status
+- `created_at_unix_ms`
+
+There are no `valid_from_unix_ms` or `valid_to_unix_ms` fields.
+
+`tron_ingest_entity_labels` accepts JSONL. Source records and evidence are
+required, and submissions are replay-safe. Only approved labels update the
+current `address_entity`, `exchange_addresses`, or `exposure_seeds` projection.
+A rejection retracts a projection only when that exact claim created it.
+Pending reviews do not change current attribution.
+
+`intelligence_reviews` is immutable confirmation/rejection history.
+`address_cluster_memberships` is the current approved membership projection,
+while `cluster_versions` preserves every membership change and member count.
+
+`tron_discover_address_clusters` scans canonical transfer evidence for
+multi-funder wallets that sweep into approved exchange service anchors and for
+high fan-in/fan-out service structures. Every detector result remains pending.
+`tron_review_intelligence` is the operator-only approval/rejection path.
+Approved clusters are exposed in the unified investigation response and Neo4j.
+
+Detailed source, label, review, and clustering formats are in
+`docs/tron_entity_intelligence.md`.
+
+Labels need provenance and analyst review. A model target must never be generated
+from the model's own prediction or from a deleted rule score.
+
+## 8. Exposure Engine
+
+`tron_propagate_exposure` loads approved seeds and propagates outgoing fund-flow
+exposure over canonical transfer edges.
+
+Each propagated row records:
+
+- source and exposed address
+- minimum hop distance
+- path count
+- exposure score
+- best path amount share
+- best path time weight
+- whether a service intermediary reduced attribution
+- last transaction and block evidence
+- direction and exposure type
+
+The edge contribution combines:
+
+- source seed severity
+- per-asset outgoing amount share
+- one hop decay per traversed edge
+- 180-day time decay
+- a lower service-mediated factor for exchange destinations
+
+Multiple independent source scores are combined with:
 
 ```text
-GET  /
-GET  /health
-GET  /status
+1 - product(1 - source_score)
+```
 
-GET  /tron/wallet/{address}/graph
-GET  /tron/wallet/{address}/fingerprint
-GET  /tron/wallet/{address}/ai-risk
-GET  /tron/wallet/{address}/holdings
-GET  /tron/wallet/{address}/investigation
-POST /tron/wallet/{address}/neo4j/import
+This is deterministic graph evidence. It is an ML input, not the final wallet
+probability.
 
-GET  /api/tron/wallet/{address}/graph
-GET  /api/tron/wallet/{address}/fingerprint
-GET  /api/tron/wallet/{address}/ai-risk
-GET  /api/tron/wallet/{address}/holdings
-GET  /api/tron/wallet/{address}/investigation
+Each seed scan has a generation in `exposure_runs`. Rows become visible only
+after the generation is complete, and readers ignore rows from older
+generations. This removes stale paths without asynchronous delete mutations.
+
+Current limitations:
+
+- Propagation follows outgoing directed flow only.
+- Best-path evidence is summarized, not persisted as a full path array.
+- The worker performs per-frontier ClickHouse queries and needs a bulk frontier
+  strategy for very large seed sets.
+- Entity/cluster-level exposure and cross-chain bridge continuation remain to be
+  added.
+
+## 9. Behavioral Fingerprint
+
+The fingerprint contains:
+
+- current entity/service identity
+- exact full-window transfer and unique transaction counts
+- exact incoming/outgoing counts and raw volumes
+- exact unique sender/receiver counts
+- exact token diversity
+- exact swap, bridge, contract-call, and exchange interaction ratios
+- timing, burst, and concentration features
+- dominant assets
+- top sender and receiver fingerprints
+- non-verdict behavior flags
+
+Full-window aggregates are computed in ClickHouse. Detailed events are capped for
+response size. `is_truncated` means the detailed sample is incomplete, not that
+the full transfer totals are capped.
+
+`wallet_type` and behavior flags are descriptive classifications such as
+collector, distributor, service hub, bridge user, or swap-heavy wallet. They are
+not laundering probabilities.
+
+## 10. ML Risk Lifecycle
+
+### 10.1 Feature contract
+
+Rust persists `wallet_ml_feature_snapshots` using:
+
+```text
+tron_wallet_behavior_features_v2
+```
+
+The feature vector combines:
+
+- volume and transaction count transforms
+- fan-in and fan-out
+- flow imbalance
+- timing/burst behavior
+- swap, bridge, exchange, and contract ratios
+- counterparty concentration
+- token diversity
+- graph exposure score, source count, path count, and hop proximity
+- identity context
+- sample truncation and data volume
+
+Feature order and schema version are part of the model artifact contract.
+
+### 10.2 Training data
+
+One unique wallet must produce one training row. Required input:
+
+```text
+address,label,<all feature columns>
+```
+
+`label=1` means the wallet belongs to the laundering/suspicious training class
+under the documented label policy. `label=0` means a reviewed benign example.
+
+The Python builders reject:
+
+- duplicate addresses
+- missing features
+- empty values
+- NaN or infinite values
+- datasets without both classes
+
+The ClickHouse export selects one latest feature snapshot per wallet, preventing
+the same wallet from appearing multiple times in random partitions. For mature
+evaluation, split by entity/cluster and time as well; address-only random splits
+can still overestimate performance when related wallets occur in different
+partitions.
+
+### 10.3 Training and calibration
+
+`ml/tron_wallet_risk/train.py`:
+
+- performs label-stratified train/validation/test splits
+- fits normalization on training data only
+- trains a PyTorch MLP with class weighting
+- fits Platt calibration on validation logits
+- evaluates calibrated metrics on an untouched test set
+- calculates tied-rank ROC AUC correctly
+- exports model, feature schema, metrics, and registration SQL
+
+The test partition is not used to fit the neural network or calibrator.
+
+`--activate` is gated by:
+
+- minimum test sample count
+- minimum test AUC
+- maximum test Brier score
+
+The defaults are a starting gate, not a regulatory acceptance policy.
+
+### 10.4 Registry and deployment
+
+`wallet_ml_training_runs` stores training provenance and train/validation/test
+counts.
+
+`wallet_ml_model_registry` stores:
+
+- model id/version/family
+- feature schema and calibration version
+- metrics and label policy
+- serialized artifact
+- SHA-256 artifact checksum
+
+`wallet_ml_model_deployments` is the production pointer for a feature schema.
+Rust first loads the deployed model. A legacy `status = ACTIVE` registry row is
+supported only for backward compatibility.
+
+Rust verifies the artifact checksum and feature shape before inference.
+
+### 10.5 Prediction and confidence
+
+`wallet_ml_predictions` stores every scored snapshot with:
+
+- calibrated risk probability and percent
+- risk level
+- confidence
+- feature contributions
+- model pattern descriptions
+- evidence references
+- model and calibration versions
+
+Confidence is not the risk probability. It combines held-out model quality,
+distance from the 0.5 decision boundary, wallet data volume, truncation, and
+out-of-distribution standardized feature distance.
+
+When AI is disabled or no model is deployed, the API returns an unavailable
+status and no probability. It does not substitute a rule formula or zero-risk
+verdict.
+
+## 11. Neo4j Contract
+
+Wallet identity is:
+
+```text
+(chain, address)
+```
+
+TRON wallets use `chain = 'tron'`. This prevents collisions when the platform
+adds other chains.
+
+Neo4j is updated only by explicit projection commands:
+
+```text
 POST /api/tron/wallet/{address}/neo4j/import
 ```
 
-Address validation:
+GET endpoints are read-only and build their response from ClickHouse. They do
+not mutate Neo4j.
 
-- All wallet endpoints normalize addresses through
-  `utils::tron_address::normalize_tron_address`.
-- Invalid TRON addresses return HTTP 400.
+Only real transfer relationships are projected. Semantic swap/bridge/mint/burn
+events are not represented as fabricated wallet nodes.
 
-## 16. Dashboard UI
-
-The dashboard is served from:
-
-- `app/web/index.html`
-
-It calls:
+The two-wallet path API searches ClickHouse up to ten hops:
 
 ```text
-/api/tron/wallet/{address}/investigation
+GET /api/tron/wallet/{source}/paths/{target}
 ```
 
-UI panels:
+It returns paths and an optional Neo4j browser query. Search limits and
+truncation are explicit in the response.
 
-- Graph visualization.
-- Risk summary.
-- Fingerprint.
-- Holdings.
-- Data quality.
-- Exchange interactions.
-- Neo4j.
-- Selected node detail.
+## 12. Analytical Node
 
-The right-hand inspector uses tabs. The default tab is currently holdings.
+The analytical node persists:
 
-Future UI rule:
+- current subject pointer
+- immutable wallet analysis snapshots
+- extracted evidence rows
+- optional job state
 
-- Keep one primary investigation screen.
-- Do not force analysts to call separate APIs manually.
-- Always show model status and data quality next to model output.
-- Make evidence visible beside the score.
+The wallet snapshot includes graph, holdings, fingerprint, exposure, model
+identity, risk availability, evidence, warnings, and the warehouse data cutoff.
 
-## 17. What Is TRON-Specific
+Freshness uses the latest complete `ingested_blocks` cutoff, not the last edge in
+a truncated graph. It also stores an `analysis_input_version` covering current
+entity attribution, exposure generation/seed state, deployed model, and relevant
+token metadata. A stored snapshot is regenerated when its chain cutoff or any
+of those non-chain intelligence inputs changes.
 
-These pieces are TRON-specific and must be replaced or adapted for another chain:
+`risk_available` distinguishes:
 
-- Address normalization and validation.
-- Native transfer parser.
-- TRC20 Transfer event parser.
-- TRON zero address handling.
-- TRON RPC/TronGrid client.
-- TRON transaction contract type mapping.
-- TRON energy/net/fee fields.
-- TRON contract metadata extraction.
-- TRON-specific protocol and method id classifier.
-- TRON exchange seed addresses.
-- TRON database name and route namespace.
+- a valid model probability of zero
+- AI disabled
+- model not trained/deployed
+- inference unavailable
 
-## 18. What Is Chain-Agnostic
+## 13. API Contract
 
-These pieces should be reused conceptually for every chain:
+Health and readiness:
 
-- Canonical `address_relationships` graph table.
-- Raw transactions/logs/token transfer staging.
-- Entity and exchange attribution model.
-- Transaction semantic feature table.
-- Transaction evidence risk table.
-- Holdings delta table and balance view pattern.
-- Exposure seed and propagation model.
-- Wallet fingerprint response model.
-- Wallet ML label/snapshot/training/model/prediction lifecycle.
-- Unified investigation endpoint.
-- Neo4j graph import contract.
-- Dashboard evidence-first analyst workflow.
+```text
+GET /health
+GET /ready
+```
 
-## 19. Future Chain Implementation Template
+`/health` is process liveness. `/ready` checks ClickHouse and Neo4j and returns
+HTTP 503 when either is unavailable.
 
-For a new chain, implement the following in order.
+Wallet routes:
 
-### 19.1 Schema
+```text
+GET  /api/tron/wallet/{address}/graph
+GET  /api/tron/wallet/{address}/holdings
+GET  /api/tron/wallet/{address}/fingerprint
+GET  /api/tron/wallet/{address}/ai-risk
+GET  /api/tron/wallet/{address}/investigation
+GET  /api/tron/wallet/{source}/paths/{target}
+GET  /api/analysis/tron/wallet/{address}
+POST /api/tron/wallet/{address}/neo4j/import
+```
 
-1. Create `init_database_<chain>.sql`.
-2. Use equivalent canonical tables:
-   - raw transactions
-   - raw logs/events
-   - token transfers
-   - token metadata
-   - address relationships
-   - entity/exchange attribution
-   - contract metadata
-   - transaction features
-   - transaction risk/evidence
-   - wallet asset balance deltas
-   - wallet asset balances view
-   - exposure seeds
-   - address exposure
-   - address profiles
-   - address counterparties
-   - wallet ML lifecycle tables
-   - sync state
-3. Add `<chain>_init_schema.rs` or extend the migration runner.
-4. Use immutable migration checksums after bootstrap.
-5. Gate destructive cleanup behind an env flag.
+All addresses are normalized and validated. Invalid addresses return HTTP 400.
+Internal errors return HTTP 500; dependency readiness is reported separately.
 
-### 19.2 Ingestion
+## 14. Runtime Configuration
 
-1. Implement a chain RPC client.
-2. Parse native transfers.
-3. Parse token transfers.
-4. Persist raw chain rows.
-5. Persist token metadata.
-6. Build semantic events.
-7. Build canonical relationship rows.
-8. Build transaction features and transaction evidence risk.
-9. Build address profiles and counterparties.
-10. Update sync state.
+Important settings:
 
-### 19.3 Intelligence
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APP_MODE` | `tron` | Active chain ingestion mode |
+| `SYNC_MODE` | `auto` | `backfill`, `live`, or `auto` |
+| `CLICKHOUSE_URL` | `http://localhost:8123` | ClickHouse HTTP endpoint |
+| `CLICKHOUSE_USER` | `admin` | ClickHouse user |
+| `CLICKHOUSE_PASSWORD` | local Compose value | ClickHouse password |
+| `CLICKHOUSE_DB_TRON` | `tron_db` | TRON database |
+| `TRON_RPC_URL` | `https://api.trongrid.io` | Full-node/TronGrid endpoint |
+| `TRON_API_KEY` | none | Optional TronGrid key |
+| `TRON_START_BLOCK` | `0` | Backfill start |
+| `TOTAL_TRON_TXS` | `200` | Per-pass limit; `0` is unlimited |
+| `TRON_POLL_INTERVAL_SECONDS` | `3` | Live finalized-head polling |
+| `TRON_METADATA_POLL_INTERVAL_SECONDS` | `5` | Metadata queue polling |
+| `TRON_METADATA_BATCH_SIZE` | `100` | Metadata jobs per pass |
+| `TRON_METADATA_MAX_ATTEMPTS` | `5` | Metadata retry limit |
+| `NEO4J_URI` | `localhost:7687` | Neo4j Bolt endpoint |
+| `NEO4J_USERNAME` | `neo4j` | Neo4j user |
+| `NEO4J_PASSWORD` | local Compose value | Neo4j password |
 
-1. Add known service/exchange seed data.
-2. Add stored attribution loading.
-3. Add heuristic exchange/service detection.
-4. Add exchange flow rows.
-5. Add exposure propagation.
-6. Add entity enrichment for graph nodes.
+Process environment variables take precedence. When a variable is absent, the
+application also reads `.env` from the current directory or `app/.env`, then
+uses the documented development default.
 
-### 19.4 Wallet Investigation
+Local defaults are for development only. Production deployment must inject
+secrets and node endpoints through its secret manager.
 
-1. Add holdings service.
-2. Add fingerprint service.
-3. Add exposure summary service.
-4. Add ML feature builder.
-5. Add AI model inference loader.
-6. Add unified investigation endpoint.
-7. Add UI chain selector or route namespace.
-
-### 19.5 ML
-
-1. Decide whether to reuse the TRON feature schema or create
-   `<chain>_wallet_behavior_features_v1`.
-2. Generate wallet feature snapshots from stored evidence.
-3. Insert wallet labels.
-4. Export training CSV.
-5. Train PyTorch model.
-6. Register active model artifact.
-7. Persist predictions.
-8. Track model metrics and calibration version.
-
-## 20. Current Strengths
-
-The current TRON implementation already has:
-
-- Unified wallet investigation endpoint.
-- ClickHouse-backed canonical graph relationships.
-- Neo4j visualization/import path.
-- Wallet holdings from reconstructable deltas.
-- Behavioral fingerprint service.
-- Exchange attribution foundations.
-- Exposure propagation foundations.
-- ML-native wallet risk tables.
-- PyTorch training and registration pipeline.
-- Feature snapshot persistence.
-- Prediction persistence.
-- Dashboard consuming the unified investigation endpoint.
-- Safe schema migration and cleanup guard.
-
-## 21. Current Gaps and Next Work
-
-To become closer to a professional Chainalysis-style system, the remaining work
-should focus on depth and data quality:
-
-1. Improve label quality.
-   - Labels must come from confirmed cases, sanctions/enforcement lists,
-     analyst-reviewed clusters, known scams, known clean wallets, and known
-     service wallets.
-
-2. Expand seed/entity ingestion.
-   - Current exchange seed coverage is small.
-   - Add formal importers for exchange lists, scam reports, sanctions, internal
-     case labels, and service wallets.
-
-3. Improve exposure propagation.
-   - Add reverse traversal.
-   - Persist exact paths.
-   - Add amount-weighted, time-weighted, and token-aware exposure.
-   - Avoid naive risk transfer through major exchanges.
-
-4. Improve semantic detectors.
-   - Broaden DEX, bridge, lending, staking, mixer, and scam contract detection.
-   - Add protocol registry updates.
-   - Improve method signature coverage.
-
-5. Improve wallet features.
-   - Add temporal burst windows.
-   - Add layering depth.
-   - Add peel-chain patterns.
-   - Add exchange cash-in/cash-out velocity.
-   - Add bridge-hop features.
-   - Add token risk features.
-   - Add graph centrality features.
-
-6. Improve ML lifecycle.
-   - Add train/validation/test split discipline.
-   - Add temporal validation to avoid future leakage.
-   - Add calibration metrics.
-   - Add threshold policy by business use case.
-   - Add model version comparison.
-   - Add drift monitoring.
-
-7. Improve analyst workflow.
-   - Add evidence panels for paths, features, labels, and model contribution.
-   - Add analyst notes and case management.
-   - Add exportable reports.
-   - Add saved investigations.
-
-8. Improve operations.
-   - Add repeatable seed ingestion jobs.
-   - Add ingestion monitoring.
-   - Add model registration CLI.
-   - Add migration tests.
-   - Add integration tests with ClickHouse and Neo4j fixtures.
-
-## 22. Important Design Rules
-
-Keep these rules for TRON and all future chains:
-
-1. Store evidence first.
-   - AI must operate on persisted, auditable evidence from ClickHouse.
-
-2. Keep raw and semantic data separate.
-   - Raw transactions/logs should remain reconstructable.
-   - Semantic AML events should be derived and explainable.
-
-3. Do not treat deterministic features as final wallet risk.
-   - Transaction risk and semantic flags are evidence.
-   - Wallet laundering probability is the trained model output.
-
-4. Version all model inputs.
-   - Feature schema changes must create a new schema version.
-
-5. Do not train on future information.
-   - Feature snapshots must use only data available at or before the label
-     decision time.
-
-6. Keep holdings reconstructable.
-   - Use deltas and views, not redundant mutable balance tables.
-
-7. Make model status explicit.
-   - `MODEL_NOT_TRAINED` is better than a fake score.
-
-8. Return data quality warnings.
-   - Analysts need to know when a graph, fingerprint, or holding set is
-     incomplete.
-
-9. Keep ClickHouse as source of truth.
-   - Neo4j is a graph layer, not the canonical warehouse.
-
-10. Keep the unified investigation contract stable.
-    - Future chains should feel identical to investigate from the UI/API.
-
-## 23. Minimal End-to-End TRON Runbook
+## 15. Operating the TRON Stack
 
 Start dependencies:
 
@@ -1169,62 +682,164 @@ cd D:\Sarbazi\dockerizd_eth_code\app
 docker compose up -d clickhouse neo4j
 ```
 
-Initialize schema:
+Apply and validate schema:
 
 ```powershell
 cargo run --bin tron_init_schema
 ```
 
-Run API/dashboard:
+Run continuous ingestion:
 
 ```powershell
-$env:TRON_GRAPH_API_ADDR="127.0.0.1:4001"
+cargo run --bin arz_axum_for_services
+```
+
+Run metadata enrichment in another process:
+
+```powershell
+cargo run --bin tron_token_metadata_worker
+```
+
+Import governed labels and seeds:
+
+```powershell
+cargo run --bin tron_ingest_entity_labels -- <labels.jsonl>
+```
+
+Propagate exposure:
+
+```powershell
+cargo run --bin tron_propagate_exposure
+```
+
+Run API/UI:
+
+```powershell
 cargo run --bin tron_graph_api
 ```
 
-Open dashboard:
+Open:
 
 ```text
 http://127.0.0.1:4001/
 ```
 
-Call unified investigation API:
-
-```text
-GET http://127.0.0.1:4001/api/tron/wallet/<wallet>/investigation?depth=3&limit=500&window_days=90&top_counterparties=25&max_events=20000&holdings_limit=100
-```
-
-Build training data from labeled wallets:
+Check dependencies:
 
 ```powershell
-cd D:\Sarbazi\dockerizd_eth_code
-python ml\tron_wallet_risk\build_training_csv_from_api.py --labels ml\tron_wallet_risk\my_labeled_wallets.csv --output ml\tron_wallet_risk\training.csv --labels-sql-output ml\tron_wallet_risk\insert_labels.sql --api-base http://127.0.0.1:4001
+Invoke-RestMethod http://127.0.0.1:4001/ready
 ```
 
-Train model:
+Apply/validate the schema and smoke-test ClickHouse plus Neo4j:
 
 ```powershell
-python ml\tron_wallet_risk\train.py --input ml\tron_wallet_risk\training.csv --output-dir ml\tron_wallet_risk\artifacts\tron_wallet_pytorch_mlp_v1 --activate
+cargo test --test tron_stack_smoke -- --ignored
 ```
 
-Register generated model SQL in ClickHouse, then call:
+## 16. Removed or Deprecated Objects
 
-```text
-GET http://127.0.0.1:4001/api/tron/wallet/<wallet>/ai-risk?window_days=90&top_counterparties=25&max_events=20000
-```
+The active architecture does not use:
 
-## 24. Summary
+- `transaction_risk`
+- `address_profiles`
+- `address_counterparties`
+- `address_token_delta`
+- `address_token_balance`
+- `mv_token_balance`
+- `wallet_asset_balance_deltas` v1
+- `wallet_asset_balance_deltas_v2`
+- active writes to legacy `raw_logs` and `token_transfers`
+- synthetic semantic graph edges
+- formula-based wallet risk assessments
 
-The TRON implementation is currently a coherent AML investigation stack:
+Obsolete data objects are dropped only when
+`TRON_ALLOW_DESTRUCTIVE_SCHEMA_CLEANUP=true`. Active tables are never dropped
+merely because a migration-added column is missing; they are migrated in place
+and validated afterward.
 
-- It indexes raw chain evidence into ClickHouse.
-- It derives semantic AML events and graph relationships.
-- It computes holdings from reconstructable deltas.
-- It builds wallet fingerprints and exposure summaries.
-- It exposes a unified investigation API and dashboard.
-- It supports a PyTorch-based AI wallet risk model using persisted feature
-  snapshots and a model registry.
+## 17. Template for Future Chains
 
-For future networks, copy the canonical architecture and contracts from this
-document, then replace only the chain-specific parsing, normalization,
-classification, and seed data.
+Every chain adapter must implement these layers in order:
+
+1. **Finalized canonical ingestion**
+   - chain-native finality policy
+   - block journal and reorg handling
+   - exact amounts
+   - replay-safe event identity
+   - minimal execution header and canonical evidence references
+   - raw payload retention only when it cannot be recovered from the owned node
+     or is required by a defined reprocessing policy
+
+2. **Canonical money movement**
+   - native transfers
+   - fungible token transfers
+   - internal transfers/traces where supported
+   - mint/burn handling
+   - failed/reverted execution behavior
+
+3. **Asynchronous enrichment**
+   - token metadata
+   - contracts/protocols
+   - entities/services
+   - source provenance and retries
+
+4. **Semantic evidence**
+   - swaps
+   - bridges
+   - liquidity
+   - exchange ingress/egress
+   - chain-specific typologies
+
+5. **Graph and exposure**
+   - chain-aware `(chain, address)` identity
+   - explicit Neo4j projection
+   - governed seeds
+   - amount/time/hop/service weighting
+
+6. **Wallet investigation**
+   - holdings with completeness state
+   - full-window fingerprint
+   - graph and path output
+   - data quality
+   - durable analytical snapshot
+
+7. **ML lifecycle**
+   - versioned features
+   - governed labels
+   - entity/time-aware train/validation/test splits
+   - calibration and untouched evaluation
+   - checksummed artifact registry
+   - explicit deployment pointer and rollback
+   - persisted explainable predictions
+
+Do not copy chain-specific parser assumptions into the shared model. Normalize
+each chain into the shared evidence contract.
+
+## 18. Remaining Production Deliverables
+
+The current code is a serious TRON foundation, but it is not yet equivalent to
+Chainalysis. The highest-priority remaining work is:
+
+1. Add authoritative balance reconciliation against a local full/solidity node.
+2. Add explicit finalized-hash repair tooling after a local TRON node is the
+   configured canonical authority.
+3. Add TRC10 metadata enrichment and validate rare contract/value variants
+   against a long-running local-node corpus.
+4. Replace the small embedded exchange seed set with governed, versioned entity
+   feeds and analyst review workflows.
+5. Persist full exposure paths and add entity/cluster and cross-chain exposure.
+6. Add cluster/entity resolution and service deposit-address attribution.
+7. Add entity- and time-grouped ML evaluation, class-prevalence monitoring,
+   precision/recall operating points, and drift monitoring.
+8. Add model deployment history, rollback CLI, shadow evaluation, and approval
+   workflow.
+9. Add authenticated analyst cases, notes, dispositions, audit logs, and role
+   based access.
+10. Extend current ClickHouse/Neo4j smoke tests and ingestion monitoring with
+    alert delivery, backups, restore tests, and disaster recovery.
+11. Replace the static SVG graph with scalable graph rendering, filtering, path
+    evidence, and large-graph summarization.
+12. Extract chain-agnostic interfaces before adding the remaining networks.
+
+These are tracked as explicit gaps so the product does not overstate its
+coverage or confidence.

@@ -26,6 +26,13 @@ struct EntityMetadata {
     confidence: f32,
 }
 
+#[derive(Debug, Clone)]
+struct ClusterMetadata {
+    cluster_id: String,
+    address_role: String,
+    confidence: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PathSearchDirection {
     Outgoing,
@@ -87,15 +94,16 @@ struct RelationshipReadRow {
     timestamp_unix: u64,
     amount_string: String,
     transfer_type: String,
+    operation_type: String,
     protocol: String,
     exchange_flow_type: String,
     exchange_name: String,
     exchange_confidence: f32,
-    risk_score: u8,
 }
 
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
 struct ExchangeMetadataRow {
+    address: String,
     exchange_name: String,
     address_role: String,
     confidence: f32,
@@ -105,19 +113,30 @@ struct ExchangeMetadataRow {
 
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
 struct EntityMetadataRow {
+    address: String,
     entity_name: String,
     entity_type: String,
     confidence: f32,
 }
 
+#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
+struct ClusterMetadataRow {
+    address: String,
+    cluster_id: String,
+    address_role: String,
+    confidence: f32,
+}
+
 pub async fn build_wallet_flow_graph(
     clickhouse: Arc<Client>,
-    neo4j: &Neo4jClient,
+    neo4j: Option<&Neo4jClient>,
     address: &str,
     depth: u8,
     per_address_limit: u64,
 ) -> anyhow::Result<WalletFlowGraph> {
-    neo4j.ensure_schema().await?;
+    if let Some(neo4j) = neo4j {
+        neo4j.ensure_schema().await?;
+    }
 
     let depth = depth.clamp(1, 6);
     let per_address_limit = per_address_limit.clamp(1, 2_000);
@@ -133,15 +152,8 @@ pub async fn build_wallet_flow_graph(
     }
     node_ids.insert(address.to_string());
 
-    let mut exchange_metadata = HashMap::<String, ExchangeMetadata>::new();
-    let mut entity_metadata = HashMap::<String, EntityMetadata>::new();
-    for node_id in &node_ids {
-        if let Some(exchange) = load_exchange_metadata(&clickhouse, node_id).await? {
-            exchange_metadata.insert(node_id.clone(), exchange);
-        } else if let Some(entity) = load_entity_metadata(&clickhouse, node_id).await? {
-            entity_metadata.insert(node_id.clone(), entity);
-        }
-    }
+    let (exchange_metadata, entity_metadata, cluster_metadata) =
+        load_node_metadata(&clickhouse, &node_ids).await?;
 
     let mut nodes = Vec::<FlowNode>::new();
     for node_id in node_ids {
@@ -149,75 +161,88 @@ pub async fn build_wallet_flow_graph(
             &node_id,
             exchange_metadata.get(&node_id),
             entity_metadata.get(&node_id),
+            cluster_metadata.get(&node_id),
             &edges,
         );
 
-        upsert_wallet_with_metadata(
-            neo4j,
-            &node.id,
-            &node.label,
-            &node.node_type,
-            node.entity_name.as_deref(),
-            node.entity_type.as_deref(),
-            node.exchange_name.as_deref(),
-            node.exchange_role.as_deref(),
-            node.confidence,
-        )
-        .await?;
+        if let Some(neo4j) = neo4j {
+            upsert_wallet_with_metadata(
+                neo4j,
+                &node.id,
+                &node.label,
+                &node.node_type,
+                node.entity_name.as_deref(),
+                node.entity_type.as_deref(),
+                node.exchange_name.as_deref(),
+                node.exchange_role.as_deref(),
+                node.cluster_id.as_deref(),
+                node.cluster_role.as_deref(),
+                node.confidence,
+            )
+            .await?;
+        }
 
         nodes.push(node);
     }
 
-    for edge in &edges {
-        merge_transfer_edge(
-            neo4j,
-            &edge.id,
-            &edge.from,
-            &edge.to,
-            &edge.tx_hash,
-            &edge.token_address,
-            &edge.amount,
-            edge.block_number,
-            edge.timestamp,
-            edge.risk_score,
-            &edge.transfer_type,
-            &edge.operation_type,
-            &edge.relationship_type,
-            &edge.protocol,
-            edge.exchange_flow_type.as_deref(),
-            edge.exchange_name.as_deref(),
-            edge.exchange_confidence,
-        )
-        .await?;
+    if let Some(neo4j) = neo4j {
+        for edge in &edges {
+            merge_transfer_edge(
+                neo4j,
+                &edge.id,
+                &edge.from,
+                &edge.to,
+                &edge.tx_hash,
+                &edge.token_address,
+                &edge.amount,
+                edge.block_number,
+                edge.timestamp,
+                &edge.transfer_type,
+                &edge.operation_type,
+                &edge.relationship_type,
+                &edge.protocol,
+                edge.exchange_flow_type.as_deref(),
+                edge.exchange_name.as_deref(),
+                edge.exchange_confidence,
+            )
+            .await?;
+        }
     }
 
     let incoming_origins = incoming_origin_nodes(address, &nodes, &edges);
 
     let exchange_interactions = exchange_summaries(address, &edges, &exchange_metadata);
 
-    for interaction in &exchange_interactions {
-        merge_exchange_interaction(
-            neo4j,
-            address,
-            &interaction.exchange_name,
-            &interaction.address,
-            &interaction.exchange_role,
-            &interaction.direction,
-            &interaction.tx_hash,
-            &interaction.token_address,
-            &interaction.amount,
-            interaction.block_number,
-            interaction.confidence,
-        )
-        .await?;
+    if let Some(neo4j) = neo4j {
+        for interaction in &exchange_interactions {
+            merge_exchange_interaction(
+                neo4j,
+                address,
+                &interaction.exchange_name,
+                &interaction.address,
+                &interaction.exchange_role,
+                &interaction.direction,
+                &interaction.tx_hash,
+                &interaction.token_address,
+                &interaction.amount,
+                interaction.block_number,
+                interaction.confidence,
+            )
+            .await?;
+        }
     }
 
+    let was_projected = neo4j.is_some();
     let neo4j_visualization = Neo4jVisualization {
         browser_url: "http://localhost:7474/browser/".to_string(),
         cypher: neo4j_browser_cypher(address, depth, per_address_limit),
-        imported_wallet_nodes: nodes.len(),
-        imported_transfer_edges: edges.len(),
-        imported_exchange_interactions: exchange_interactions.len(),
+        imported_wallet_nodes: if was_projected { nodes.len() } else { 0 },
+        imported_transfer_edges: if was_projected { edges.len() } else { 0 },
+        imported_exchange_interactions: if was_projected {
+            exchange_interactions.len()
+        } else {
+            0
+        },
     };
 
     Ok(WalletFlowGraph {
@@ -234,7 +259,7 @@ pub async fn build_wallet_flow_graph(
 #[allow(clippy::too_many_arguments)]
 pub async fn build_wallet_path_graph(
     clickhouse: Arc<Client>,
-    neo4j: &Neo4jClient,
+    neo4j: Option<&Neo4jClient>,
     source_address: &str,
     target_address: &str,
     max_depth: Option<u8>,
@@ -242,7 +267,9 @@ pub async fn build_wallet_path_graph(
     per_address_limit: Option<u64>,
     direction: Option<&str>,
 ) -> anyhow::Result<WalletPathGraph> {
-    neo4j.ensure_schema().await?;
+    if let Some(neo4j) = neo4j {
+        neo4j.ensure_schema().await?;
+    }
 
     let max_depth = max_depth.unwrap_or(10).clamp(1, 10);
     let max_paths = max_paths.unwrap_or(20).clamp(1, 50);
@@ -287,16 +314,8 @@ pub async fn build_wallet_path_graph(
     }
 
     let edges = edge_by_id.into_values().collect::<Vec<_>>();
-    let mut exchange_metadata = HashMap::<String, ExchangeMetadata>::new();
-    let mut entity_metadata = HashMap::<String, EntityMetadata>::new();
-
-    for node_id in &node_ids {
-        if let Some(exchange) = load_exchange_metadata(&clickhouse, node_id).await? {
-            exchange_metadata.insert(node_id.clone(), exchange);
-        } else if let Some(entity) = load_entity_metadata(&clickhouse, node_id).await? {
-            entity_metadata.insert(node_id.clone(), entity);
-        }
-    }
+    let (exchange_metadata, entity_metadata, cluster_metadata) =
+        load_node_metadata(&clickhouse, &node_ids).await?;
 
     let mut nodes = Vec::<FlowNode>::new();
     for node_id in node_ids {
@@ -304,48 +323,55 @@ pub async fn build_wallet_path_graph(
             &node_id,
             exchange_metadata.get(&node_id),
             entity_metadata.get(&node_id),
+            cluster_metadata.get(&node_id),
             &edges,
         );
 
-        upsert_wallet_with_metadata(
-            neo4j,
-            &node.id,
-            &node.label,
-            &node.node_type,
-            node.entity_name.as_deref(),
-            node.entity_type.as_deref(),
-            node.exchange_name.as_deref(),
-            node.exchange_role.as_deref(),
-            node.confidence,
-        )
-        .await?;
+        if let Some(neo4j) = neo4j {
+            upsert_wallet_with_metadata(
+                neo4j,
+                &node.id,
+                &node.label,
+                &node.node_type,
+                node.entity_name.as_deref(),
+                node.entity_type.as_deref(),
+                node.exchange_name.as_deref(),
+                node.exchange_role.as_deref(),
+                node.cluster_id.as_deref(),
+                node.cluster_role.as_deref(),
+                node.confidence,
+            )
+            .await?;
+        }
 
         nodes.push(node);
     }
 
-    for edge in &edges {
-        merge_transfer_edge(
-            neo4j,
-            &edge.id,
-            &edge.from,
-            &edge.to,
-            &edge.tx_hash,
-            &edge.token_address,
-            &edge.amount,
-            edge.block_number,
-            edge.timestamp,
-            edge.risk_score,
-            &edge.transfer_type,
-            &edge.operation_type,
-            &edge.relationship_type,
-            &edge.protocol,
-            edge.exchange_flow_type.as_deref(),
-            edge.exchange_name.as_deref(),
-            edge.exchange_confidence,
-        )
-        .await?;
+    if let Some(neo4j) = neo4j {
+        for edge in &edges {
+            merge_transfer_edge(
+                neo4j,
+                &edge.id,
+                &edge.from,
+                &edge.to,
+                &edge.tx_hash,
+                &edge.token_address,
+                &edge.amount,
+                edge.block_number,
+                edge.timestamp,
+                &edge.transfer_type,
+                &edge.operation_type,
+                &edge.relationship_type,
+                &edge.protocol,
+                edge.exchange_flow_type.as_deref(),
+                edge.exchange_name.as_deref(),
+                edge.exchange_confidence,
+            )
+            .await?;
+        }
     }
 
+    let was_projected = neo4j.is_some();
     let neo4j_visualization = Neo4jVisualization {
         browser_url: "http://localhost:7474/browser/".to_string(),
         cypher: neo4j_path_cypher(
@@ -355,8 +381,8 @@ pub async fn build_wallet_path_graph(
             max_paths,
             direction,
         ),
-        imported_wallet_nodes: nodes.len(),
-        imported_transfer_edges: edges.len(),
+        imported_wallet_nodes: if was_projected { nodes.len() } else { 0 },
+        imported_transfer_edges: if was_projected { edges.len() } else { 0 },
         imported_exchange_interactions: 0,
     };
 
@@ -414,6 +440,9 @@ async fn find_wallet_paths(
             per_address_limit,
         )
         .await?;
+        if rows.len() as u64 >= per_address_limit {
+            truncated = true;
+        }
 
         for row in rows {
             let edge = relationship_row_to_edge(row);
@@ -499,47 +528,60 @@ async fn load_relationship_neighborhood(
     clickhouse: Arc<Client>,
     address: &str,
     depth: u8,
-    per_address_limit: u64,
+    edge_limit: u64,
 ) -> anyhow::Result<Vec<FlowEdge>> {
-    let mut queue = VecDeque::<(String, u8)>::from([(address.to_string(), 0)]);
+    let mut frontier = vec![address.to_string()];
     let mut visited = HashSet::<String>::new();
     let mut edge_ids = HashSet::<String>::new();
     let mut edges = Vec::<FlowEdge>::new();
 
-    while let Some((current, current_depth)) = queue.pop_front() {
-        if current_depth >= depth || !visited.insert(current.clone()) {
-            continue;
+    for current_depth in 0..depth {
+        frontier.retain(|address| visited.insert(address.clone()));
+        if frontier.is_empty() || edges.len() as u64 >= edge_limit {
+            break;
         }
 
-        let rows = load_relationships_for_address(&clickhouse, &current, per_address_limit).await?;
+        let remaining = edge_limit.saturating_sub(edges.len() as u64);
+        let rows = load_relationships_for_addresses(&clickhouse, &frontier, remaining).await?;
+        let mut next_frontier = Vec::new();
+        let mut next_seen = HashSet::new();
 
         for row in rows {
             let edge = relationship_row_to_edge(row);
 
             if edge_ids.insert(edge.id.clone()) {
                 if current_depth + 1 < depth {
-                    if edge.from != current {
-                        queue.push_back((edge.from.clone(), current_depth + 1));
+                    if !visited.contains(&edge.from) && next_seen.insert(edge.from.clone()) {
+                        next_frontier.push(edge.from.clone());
                     }
 
-                    if edge.to != current {
-                        queue.push_back((edge.to.clone(), current_depth + 1));
+                    if !visited.contains(&edge.to) && next_seen.insert(edge.to.clone()) {
+                        next_frontier.push(edge.to.clone());
                     }
                 }
 
                 edges.push(edge);
+                if edges.len() as u64 >= edge_limit {
+                    break;
+                }
             }
         }
+
+        frontier = next_frontier;
     }
 
     Ok(edges)
 }
 
-async fn load_relationships_for_address(
+async fn load_relationships_for_addresses(
     clickhouse: &Client,
-    address: &str,
+    addresses: &[String],
     limit: u64,
 ) -> anyhow::Result<Vec<RelationshipReadRow>> {
+    if addresses.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let rows = clickhouse
         .query(
             r#"
@@ -553,12 +595,12 @@ async fn load_relationships_for_address(
                 toUInt64(ar.timestamp) AS timestamp_unix,
                 toString(ar.amount) AS amount_string,
                 ar.transfer_type,
+                ar.operation_type,
                 ar.protocol,
                 ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
                 ifNull(ef.exchange_name, '') AS exchange_name,
-                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
-                ar.risk_score
-            FROM address_relationships AS ar
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence
+            FROM address_relationships_canonical AS ar
             LEFT JOIN
             (
                 SELECT
@@ -570,7 +612,7 @@ async fn load_relationships_for_address(
                     any(exchange_name) AS exchange_name,
                     any(flow_type) AS exchange_flow_type,
                     max(confidence) AS exchange_confidence
-                FROM exchange_flows
+                FROM exchange_flows_canonical
                 GROUP BY
                     tx_hash,
                     from_address,
@@ -583,13 +625,13 @@ async fn load_relationships_for_address(
                 AND ar.to_address = ef.to_address
                 AND ar.token_address = ef.token_address
                 AND ar.amount = ef.amount
-            WHERE ar.from_address = ? OR ar.to_address = ?
+            WHERE ar.from_address IN ? OR ar.to_address IN ?
             ORDER BY ar.block_number DESC
             LIMIT ?
             "#,
         )
-        .bind(address)
-        .bind(address)
+        .bind(addresses)
+        .bind(addresses)
         .bind(limit)
         .fetch_all::<RelationshipReadRow>()
         .await?;
@@ -616,12 +658,12 @@ async fn load_path_relationships_for_address(
                 toUInt64(ar.timestamp) AS timestamp_unix,
                 toString(ar.amount) AS amount_string,
                 ar.transfer_type,
+                ar.operation_type,
                 ar.protocol,
                 ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
                 ifNull(ef.exchange_name, '') AS exchange_name,
-                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
-                ar.risk_score
-            FROM address_relationships AS ar
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence
+            FROM address_relationships_canonical AS ar
             LEFT JOIN
             (
                 SELECT
@@ -633,7 +675,7 @@ async fn load_path_relationships_for_address(
                     any(exchange_name) AS exchange_name,
                     any(flow_type) AS exchange_flow_type,
                     max(confidence) AS exchange_confidence
-                FROM exchange_flows
+                FROM exchange_flows_canonical
                 GROUP BY
                     tx_hash,
                     from_address,
@@ -663,12 +705,12 @@ async fn load_path_relationships_for_address(
                 toUInt64(ar.timestamp) AS timestamp_unix,
                 toString(ar.amount) AS amount_string,
                 ar.transfer_type,
+                ar.operation_type,
                 ar.protocol,
                 ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
                 ifNull(ef.exchange_name, '') AS exchange_name,
-                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
-                ar.risk_score
-            FROM address_relationships AS ar
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence
+            FROM address_relationships_canonical AS ar
             LEFT JOIN
             (
                 SELECT
@@ -680,7 +722,7 @@ async fn load_path_relationships_for_address(
                     any(exchange_name) AS exchange_name,
                     any(flow_type) AS exchange_flow_type,
                     max(confidence) AS exchange_confidence
-                FROM exchange_flows
+                FROM exchange_flows_canonical
                 GROUP BY
                     tx_hash,
                     from_address,
@@ -710,12 +752,12 @@ async fn load_path_relationships_for_address(
                 toUInt64(ar.timestamp) AS timestamp_unix,
                 toString(ar.amount) AS amount_string,
                 ar.transfer_type,
+                ar.operation_type,
                 ar.protocol,
                 ifNull(ef.exchange_flow_type, '') AS exchange_flow_type,
                 ifNull(ef.exchange_name, '') AS exchange_name,
-                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence,
-                ar.risk_score
-            FROM address_relationships AS ar
+                ifNull(ef.exchange_confidence, toFloat32(0)) AS exchange_confidence
+            FROM address_relationships_canonical AS ar
             LEFT JOIN
             (
                 SELECT
@@ -727,7 +769,7 @@ async fn load_path_relationships_for_address(
                     any(exchange_name) AS exchange_name,
                     any(flow_type) AS exchange_flow_type,
                     max(confidence) AS exchange_confidence
-                FROM exchange_flows
+                FROM exchange_flows_canonical
                 GROUP BY
                     tx_hash,
                     from_address,
@@ -757,78 +799,112 @@ async fn load_path_relationships_for_address(
     Ok(rows)
 }
 
-async fn load_exchange_metadata(
+async fn load_node_metadata(
     clickhouse: &Client,
-    address: &str,
-) -> anyhow::Result<Option<ExchangeMetadata>> {
-    let row = clickhouse
+    node_ids: &HashSet<String>,
+) -> anyhow::Result<(
+    HashMap<String, ExchangeMetadata>,
+    HashMap<String, EntityMetadata>,
+    HashMap<String, ClusterMetadata>,
+)> {
+    if node_ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new(), HashMap::new()));
+    }
+
+    let addresses = node_ids.iter().cloned().collect::<Vec<_>>();
+    let exchange_rows = clickhouse
         .query(
             r#"
             SELECT
+                address,
                 exchange_name,
                 address_role,
                 confidence,
                 last_seen_block
-            FROM
-            (
-                SELECT
-                    exchange_name,
-                    address_role,
-                    confidence,
-                    last_seen_block
-                FROM exchange_addresses
-                WHERE address = ?
-                UNION ALL
-                SELECT
-                    exchange_name,
-                    'DEPOSIT' AS address_role,
-                    confidence,
-                    last_seen_block
-                FROM exchange_deposit_addresses
-                WHERE address = ?
-            )
-            ORDER BY confidence DESC, last_seen_block DESC
-            LIMIT 1
+            FROM exchange_addresses FINAL
+            WHERE address IN ? AND is_active = 1
+            ORDER BY address, confidence DESC, last_seen_block DESC
+            LIMIT 1 BY address
             "#,
         )
-        .bind(address)
-        .bind(address)
-        .fetch_optional::<ExchangeMetadataRow>()
+        .bind(&addresses)
+        .fetch_all::<ExchangeMetadataRow>()
         .await?;
-
-    Ok(row.map(|row| ExchangeMetadata {
-        exchange_name: row.exchange_name,
-        exchange_role: row.address_role,
-        confidence: row.confidence,
-    }))
-}
-
-async fn load_entity_metadata(
-    clickhouse: &Client,
-    address: &str,
-) -> anyhow::Result<Option<EntityMetadata>> {
-    let row = clickhouse
+    let entity_rows = clickhouse
         .query(
             r#"
             SELECT
+                address,
                 entity_name,
                 entity_type,
                 confidence
-            FROM address_entity
-            WHERE address = ?
-            ORDER BY confidence DESC, created_at DESC
-            LIMIT 1
+            FROM address_entity FINAL
+            WHERE address IN ?
+              AND is_active = 1
+            ORDER BY address, confidence DESC, created_at DESC
+            LIMIT 1 BY address
             "#,
         )
-        .bind(address)
-        .fetch_optional::<EntityMetadataRow>()
+        .bind(&addresses)
+        .fetch_all::<EntityMetadataRow>()
+        .await?;
+    let cluster_rows = clickhouse
+        .query(
+            r#"
+            SELECT address, cluster_id, address_role, confidence
+            FROM address_cluster_memberships FINAL
+            WHERE chain = 'tron'
+              AND address IN ?
+              AND is_active = 1
+            ORDER BY address, confidence DESC, cluster_version DESC
+            LIMIT 1 BY address
+            "#,
+        )
+        .bind(&addresses)
+        .fetch_all::<ClusterMetadataRow>()
         .await?;
 
-    Ok(row.map(|row| EntityMetadata {
-        entity_name: row.entity_name,
-        entity_type: row.entity_type,
-        confidence: row.confidence,
-    }))
+    let exchange_metadata = exchange_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.address,
+                ExchangeMetadata {
+                    exchange_name: row.exchange_name,
+                    exchange_role: row.address_role,
+                    confidence: row.confidence,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let entity_metadata = entity_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.address,
+                EntityMetadata {
+                    entity_name: row.entity_name,
+                    entity_type: row.entity_type,
+                    confidence: row.confidence,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let cluster_metadata = cluster_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.address,
+                ClusterMetadata {
+                    cluster_id: row.cluster_id,
+                    address_role: row.address_role,
+                    confidence: row.confidence,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    Ok((exchange_metadata, entity_metadata, cluster_metadata))
 }
 
 fn relationship_row_to_edge(row: RelationshipReadRow) -> FlowEdge {
@@ -839,8 +915,8 @@ fn relationship_row_to_edge(row: RelationshipReadRow) -> FlowEdge {
     } else {
         None
     };
-    let operation_type = exchange_flow_type
-        .clone()
+    let operation_type = non_empty_string(row.operation_type)
+        .or_else(|| exchange_flow_type.clone())
         .unwrap_or_else(|| row.transfer_type.clone());
     let relationship_type = neo4j_relationship_type(&operation_type, &row.transfer_type);
 
@@ -860,7 +936,6 @@ fn relationship_row_to_edge(row: RelationshipReadRow) -> FlowEdge {
         exchange_flow_type,
         exchange_name,
         exchange_confidence,
-        risk_score: row.risk_score,
     }
 }
 
@@ -868,21 +943,39 @@ fn build_flow_node(
     node_id: &str,
     exchange: Option<&ExchangeMetadata>,
     entity: Option<&EntityMetadata>,
+    cluster: Option<&ClusterMetadata>,
     edges: &[FlowEdge],
 ) -> FlowNode {
+    let cluster_id = cluster.map(|metadata| metadata.cluster_id.clone());
+    let cluster_role = cluster.map(|metadata| metadata.address_role.clone());
+    let cluster_confidence = cluster.map(|metadata| metadata.confidence);
     if let Some(exchange) = exchange {
         return FlowNode {
             id: node_id.to_string(),
             label: format!("{} ({})", exchange.exchange_name, exchange.exchange_role),
             node_type: "exchange_wallet".to_string(),
-            entity_name: Some(exchange.exchange_name.clone()),
-            entity_type: Some(format!(
-                "exchange_{}",
-                exchange.exchange_role.to_lowercase()
-            )),
+            entity_name: Some(
+                entity
+                    .map(|metadata| metadata.entity_name.clone())
+                    .unwrap_or_else(|| exchange.exchange_name.clone()),
+            ),
+            entity_type: Some(
+                entity
+                    .map(|metadata| metadata.entity_type.clone())
+                    .unwrap_or_else(|| {
+                        format!("exchange_{}", exchange.exchange_role.to_lowercase())
+                    }),
+            ),
             exchange_name: Some(exchange.exchange_name.clone()),
             exchange_role: Some(exchange.exchange_role.clone()),
-            confidence: Some(exchange.confidence),
+            cluster_id,
+            cluster_role,
+            confidence: Some(
+                exchange
+                    .confidence
+                    .max(entity.map_or(0.0, |metadata| metadata.confidence))
+                    .max(cluster_confidence.unwrap_or(0.0)),
+            ),
         };
     }
 
@@ -895,7 +988,9 @@ fn build_flow_node(
             entity_type: Some(entity.entity_type.clone()),
             exchange_name: None,
             exchange_role: None,
-            confidence: Some(entity.confidence),
+            cluster_id,
+            cluster_role,
+            confidence: Some(entity.confidence.max(cluster_confidence.unwrap_or(0.0))),
         };
     }
 
@@ -908,7 +1003,9 @@ fn build_flow_node(
         entity_type: None,
         exchange_name: None,
         exchange_role: None,
-        confidence: None,
+        cluster_id,
+        cluster_role,
+        confidence: cluster_confidence,
     }
 }
 
@@ -979,6 +1076,7 @@ fn neo4j_relationship_type(operation_type: &str, transfer_type: &str) -> String 
         operation if operation.starts_with("exchange_to_exchange") => "EXCHANGE_TRANSFER",
         _ => match transfer_type {
             "native_transfer" => "NATIVE_TRANSFER",
+            "trc10_transfer" => "TRC10_TRANSFER",
             "trc20_transfer" => "TRC20_TRANSFER",
             "internal_transfer" => "INTERNAL_TRANSFER",
             "mint" => "MINT",
@@ -1055,14 +1153,16 @@ fn short_address(address: &str) -> String {
     format!("{}...{}", &address[..6], &address[address.len() - 4..])
 }
 
+const FLOW_RELATIONSHIP_TYPES: &str = "NATIVE_TRANSFER|TRC10_TRANSFER|TRC20_TRANSFER|INTERNAL_TRANSFER|MONEY_FLOW|SWAP|BRIDGE|LIQUIDITY_ADD|LIQUIDITY_REMOVE|MINT|BURN|EXCHANGE_DEPOSIT|EXCHANGE_WITHDRAWAL|EXCHANGE_SWEEP|EXCHANGE_TRANSFER";
+
 pub fn neo4j_browser_cypher(address: &str, depth: u8, limit: u64) -> String {
     let safe_depth = depth.clamp(1, 6);
     let safe_limit = limit.clamp(1, 2_000);
     let escaped_address = address.replace('\\', "\\\\").replace('\'', "\\'");
 
     format!(
-        "MATCH p = (w:Wallet {{ address: '{}' }})-[*1..{}]-(n) RETURN p LIMIT {}",
-        escaped_address, safe_depth, safe_limit
+        "MATCH p = (w:Wallet {{ chain: 'tron', address: '{}' }})-[:{}*1..{}]-(n:Wallet) RETURN p LIMIT {}",
+        escaped_address, FLOW_RELATIONSHIP_TYPES, safe_depth, safe_limit
     )
 }
 
@@ -1080,16 +1180,16 @@ fn neo4j_path_cypher(
 
     match direction {
         PathSearchDirection::Incoming => format!(
-            "MATCH p = (source:Wallet {{ address: '{}' }})<-[*1..{}]-(target:Wallet {{ address: '{}' }}) RETURN p LIMIT {}",
-            source, safe_depth, target, safe_limit
+            "MATCH p = (source:Wallet {{ chain: 'tron', address: '{}' }})<-[:{}*1..{}]-(target:Wallet {{ chain: 'tron', address: '{}' }}) RETURN p LIMIT {}",
+            source, FLOW_RELATIONSHIP_TYPES, safe_depth, target, safe_limit
         ),
         PathSearchDirection::Any => format!(
-            "MATCH p = (source:Wallet {{ address: '{}' }})-[*1..{}]-(target:Wallet {{ address: '{}' }}) RETURN p LIMIT {}",
-            source, safe_depth, target, safe_limit
+            "MATCH p = (source:Wallet {{ chain: 'tron', address: '{}' }})-[:{}*1..{}]-(target:Wallet {{ chain: 'tron', address: '{}' }}) RETURN p LIMIT {}",
+            source, FLOW_RELATIONSHIP_TYPES, safe_depth, target, safe_limit
         ),
         PathSearchDirection::Outgoing => format!(
-            "MATCH p = (source:Wallet {{ address: '{}' }})-[*1..{}]->(target:Wallet {{ address: '{}' }}) RETURN p LIMIT {}",
-            source, safe_depth, target, safe_limit
+            "MATCH p = (source:Wallet {{ chain: 'tron', address: '{}' }})-[:{}*1..{}]->(target:Wallet {{ chain: 'tron', address: '{}' }}) RETURN p LIMIT {}",
+            source, FLOW_RELATIONSHIP_TYPES, safe_depth, target, safe_limit
         ),
     }
 }
@@ -1116,7 +1216,6 @@ mod tests {
             exchange_flow_type: None,
             exchange_name: None,
             exchange_confidence: None,
-            risk_score: 0,
         };
 
         let metadata = HashMap::from([(
@@ -1140,9 +1239,10 @@ mod tests {
     fn builds_browser_cypher_for_root_wallet() {
         let cypher = neo4j_browser_cypher("TAddress", 3, 500);
 
-        assert_eq!(
-            cypher,
-            "MATCH p = (w:Wallet { address: 'TAddress' })-[*1..3]-(n) RETURN p LIMIT 500"
-        );
+        assert!(cypher.contains("address: 'TAddress'"));
+        assert!(cypher.contains("NATIVE_TRANSFER|TRC10_TRANSFER|TRC20_TRANSFER"));
+        assert!(cypher.contains("SWAP|BRIDGE|LIQUIDITY_ADD|LIQUIDITY_REMOVE"));
+        assert!(cypher.contains("*1..3"));
+        assert!(cypher.ends_with("RETURN p LIMIT 500"));
     }
 }

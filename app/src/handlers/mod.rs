@@ -6,6 +6,7 @@ pub mod health;
 pub mod status;
 pub mod tron_common;
 pub mod tron_graph;
+pub mod tron_ingestion_health;
 pub mod tron_wallet_ai_risk;
 pub mod tron_wallet_analysis;
 pub mod tron_wallet_fingerprint;

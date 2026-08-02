@@ -6,18 +6,15 @@ use tokio::sync::Semaphore;
 
 use crate::helper::tron::TronClient;
 
-//Batcher
-use crate::services::tron::batcher::raw_logs::RawLogBatcher;
 use crate::services::tron::batcher::relationships::RelationshipBatcher;
-use crate::services::tron::batcher::token_transfers::TokenTransferBatcher;
+use crate::services::tron::batcher::semantic_events::SemanticEventBatcher;
+use crate::services::tron::batcher::token_metadata_discoveries::TokenMetadataDiscoveryBatcher;
 use crate::services::tron::batcher::transactions::TransactionBatcher;
 
 // concurency
 use crate::config::AppConfig;
-use crate::services::tron::batcher::contract_metadata::ContractMetadataBatcher;
 use crate::services::tron::batcher::exchange_flows::ExchangeFlowBatcher;
 use crate::services::tron::batcher::transaction_features::TransactionFeatureBatcher;
-use crate::services::tron::batcher::transaction_risk::TransactionRiskBatcher;
 use std::time::Duration;
 
 pub struct LoaderEth {
@@ -110,14 +107,12 @@ pub struct LoaderTron {
     pub tron_client: Arc<TronClient>,
     pub rpc_limiter: Arc<Semaphore>,
     pub transaction_batcher: Arc<TransactionBatcher>,
-    pub token_transfer_batcher: Arc<TokenTransferBatcher>,
-    pub raw_log_batcher: Arc<RawLogBatcher>,
     pub relationship_batcher: Arc<RelationshipBatcher>,
+    pub semantic_event_batcher: Arc<SemanticEventBatcher>,
+    pub token_metadata_discovery_batcher: Arc<TokenMetadataDiscoveryBatcher>,
     // batcher
     pub config: Arc<AppConfig>,
     pub transaction_feature_batcher: Arc<TransactionFeatureBatcher>,
-    pub transaction_risk_batcher: Arc<TransactionRiskBatcher>,
-    pub contract_metadata_batcher: Arc<ContractMetadataBatcher>,
     pub exchange_flow_batcher: Arc<ExchangeFlowBatcher>,
 }
 
@@ -147,55 +142,51 @@ impl LoaderTron {
         // Rate limiter
         let rpc_limiter = Arc::new(Semaphore::new(config.rpc_max_concurrency));
 
-        // batcher
+        let max_batch_rows = config.tron_ingestion_batch_max_rows.clamp(100, 100_000);
+        let flush_interval =
+            Duration::from_secs(config.tron_ingestion_flush_interval_seconds.clamp(5, 3_600));
+
         let transaction_batcher =
-            TransactionBatcher::create(clickhouse.clone(), 50_000, Duration::from_secs(1));
-
-        let token_transfer_batcher =
-            TokenTransferBatcher::create(clickhouse.clone(), 50_000, Duration::from_secs(1));
-
-        let raw_log_batcher =
-            RawLogBatcher::create(clickhouse.clone(), 50_000, Duration::from_secs(1));
+            TransactionBatcher::create(clickhouse.clone(), max_batch_rows, flush_interval);
 
         let relationship_batcher =
-            RelationshipBatcher::create(clickhouse.clone(), 50_000, Duration::from_secs(1));
+            RelationshipBatcher::create(clickhouse.clone(), max_batch_rows, flush_interval);
+
+        let semantic_event_batcher =
+            SemanticEventBatcher::create(clickhouse.clone(), max_batch_rows, flush_interval);
+
+        let token_metadata_discovery_batcher = TokenMetadataDiscoveryBatcher::create(
+            clickhouse.clone(),
+            max_batch_rows,
+            flush_interval,
+        );
 
         let transaction_feature_batcher =
-            TransactionFeatureBatcher::create(clickhouse.clone(), 10_000, Duration::from_secs(1));
-
-        let transaction_risk_batcher =
-            TransactionRiskBatcher::create(clickhouse.clone(), 10_000, Duration::from_secs(1));
-
-        let contract_metadata_batcher =
-            ContractMetadataBatcher::create(clickhouse.clone(), 10_000, Duration::from_secs(1));
+            TransactionFeatureBatcher::create(clickhouse.clone(), max_batch_rows, flush_interval);
 
         let exchange_flow_batcher =
-            ExchangeFlowBatcher::create(clickhouse.clone(), 10_000, Duration::from_secs(1));
+            ExchangeFlowBatcher::create(clickhouse.clone(), max_batch_rows, flush_interval);
 
         Ok(Self {
             clickhouse,
             tron_client,
             rpc_limiter,
             transaction_batcher,
-            token_transfer_batcher,
-            raw_log_batcher,
             relationship_batcher,
+            semantic_event_batcher,
+            token_metadata_discovery_batcher,
             config: Arc::new(config.clone()),
             transaction_feature_batcher,
-            transaction_risk_batcher,
-            contract_metadata_batcher,
             exchange_flow_batcher,
         })
     }
 
     pub async fn flush_batches(&self) -> Result<()> {
         self.transaction_batcher.flush_all().await?;
-        self.token_transfer_batcher.flush_all().await?;
-        self.raw_log_batcher.flush_all().await?;
         self.relationship_batcher.flush_all().await?;
+        self.semantic_event_batcher.flush_all().await?;
+        self.token_metadata_discovery_batcher.flush_all().await?;
         self.transaction_feature_batcher.flush_all().await?;
-        self.transaction_risk_batcher.flush_all().await?;
-        self.contract_metadata_batcher.flush_all().await?;
         self.exchange_flow_batcher.flush_all().await?;
 
         Ok(())

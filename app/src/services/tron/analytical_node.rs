@@ -8,11 +8,8 @@ use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::services::tron::{
-    neo4j::client::Neo4jClient,
-    wallet_investigation::{
-        WalletInvestigation, WalletInvestigationOptions, build_wallet_investigation,
-    },
+use crate::services::tron::wallet_investigation::{
+    WalletInvestigation, WalletInvestigationOptions, build_wallet_investigation,
 };
 
 const CHAIN: &str = "tron";
@@ -30,6 +27,7 @@ pub struct WalletAnalysisSnapshotResponse {
     pub entity_id: Option<String>,
     pub analysis_version: String,
     pub analysis_status: String,
+    pub risk_available: bool,
     pub risk_level: String,
     pub risk_probability: f32,
     pub risk_percent: u8,
@@ -38,6 +36,7 @@ pub struct WalletAnalysisSnapshotResponse {
     pub fingerprint_label: String,
     pub data_cutoff_block: u64,
     pub data_cutoff_unix_ms: u64,
+    pub analysis_input_version: String,
     pub created_at_unix_ms: u64,
     pub source_tables: Vec<String>,
     pub warnings: Vec<String>,
@@ -79,11 +78,13 @@ struct AnalysisSubjectInsertRow {
     entity_id: String,
     latest_snapshot_id: String,
     latest_status: String,
+    latest_risk_available: u8,
     latest_risk_level: String,
     latest_risk_probability: f32,
     latest_confidence: f32,
     latest_data_cutoff_block: u64,
     latest_data_cutoff_unix_ms: u64,
+    latest_input_version: String,
     created_at_unix_ms: u64,
     updated_at_unix_ms: u64,
 }
@@ -96,6 +97,7 @@ struct WalletAnalysisSnapshotInsertRow {
     entity_id: String,
     analysis_version: String,
     analysis_status: String,
+    risk_available: u8,
     risk_level: String,
     risk_probability: f32,
     risk_percent: u8,
@@ -117,6 +119,7 @@ struct WalletAnalysisSnapshotInsertRow {
     exposure_min_hop_distance: u8,
     data_cutoff_block: u64,
     data_cutoff_unix_ms: u64,
+    analysis_input_version: String,
     source_tables: Vec<String>,
     model_id: String,
     model_version: String,
@@ -135,6 +138,7 @@ struct WalletAnalysisSnapshotReadRow {
     entity_id: String,
     analysis_version: String,
     analysis_status: String,
+    risk_available: u8,
     risk_level: String,
     risk_probability: f32,
     risk_percent: u8,
@@ -143,6 +147,7 @@ struct WalletAnalysisSnapshotReadRow {
     fingerprint_label: String,
     data_cutoff_block: u64,
     data_cutoff_unix_ms: u64,
+    analysis_input_version: String,
     source_tables: Vec<String>,
     snapshot_json: String,
     warnings: Vec<String>,
@@ -150,31 +155,47 @@ struct WalletAnalysisSnapshotReadRow {
     created_at_unix_ms: u64,
 }
 
+#[derive(Debug, Deserialize, clickhouse::Row)]
+struct IndexedCutoffRow {
+    block_number: u64,
+    block_timestamp: u64,
+}
+
+#[derive(Debug, Deserialize, clickhouse::Row)]
+struct AnalysisInputVersionRow {
+    analysis_input_version: String,
+}
+
 pub async fn get_or_create_wallet_analysis_snapshot(
     clickhouse: Arc<Client>,
-    neo4j: &Neo4jClient,
     address: &str,
     options: WalletInvestigationOptions,
     refresh: bool,
 ) -> anyhow::Result<WalletAnalysisSnapshotResponse> {
-    if !refresh
-        && let Some(snapshot) =
+    if !refresh {
+        let indexed_cutoff = load_indexed_cutoff(&clickhouse).await?;
+        let input_version = load_analysis_input_version(&clickhouse, address).await?;
+
+        if let Some(snapshot) =
             load_latest_wallet_analysis_snapshot(clickhouse.clone(), address).await?
-    {
-        return Ok(snapshot);
+            && snapshot.data_cutoff_block >= indexed_cutoff.0
+            && snapshot.analysis_input_version == input_version
+        {
+            return Ok(snapshot);
+        }
     }
 
-    create_wallet_analysis_snapshot(clickhouse, neo4j, address, options).await
+    create_wallet_analysis_snapshot(clickhouse, address, options).await
 }
 
 async fn create_wallet_analysis_snapshot(
     clickhouse: Arc<Client>,
-    neo4j: &Neo4jClient,
     address: &str,
     options: WalletInvestigationOptions,
 ) -> anyhow::Result<WalletAnalysisSnapshotResponse> {
-    let investigation =
-        build_wallet_investigation(clickhouse.clone(), neo4j, address, options).await?;
+    let (data_cutoff_block, data_cutoff_unix_ms) = load_indexed_cutoff(&clickhouse).await?;
+    let analysis_input_version = load_analysis_input_version(&clickhouse, address).await?;
+    let investigation = build_wallet_investigation(clickhouse.clone(), address, options).await?;
     let created_at_unix_ms = Utc::now().timestamp_millis().max(0) as u64;
     let snapshot_id = format!(
         "tron_wallet_analysis_{}_{}",
@@ -187,7 +208,7 @@ async fn create_wallet_analysis_snapshot(
         .entity_id
         .clone()
         .unwrap_or_default();
-    let (data_cutoff_block, data_cutoff_unix_ms) = data_cutoff(&investigation);
+    let risk_available = investigation.ai_risk.risk_score.is_some();
     let risk_probability = investigation.ai_risk.risk_score.unwrap_or_default();
     let risk_percent = investigation
         .ai_risk
@@ -199,13 +220,15 @@ async fn create_wallet_analysis_snapshot(
         .unwrap_or(investigation.fingerprint.confidence);
     let evidence_refs = collect_evidence_refs(&investigation);
     let source_tables = vec![
-        "transactions".to_string(),
-        "token_transfers".to_string(),
-        "address_relationships".to_string(),
+        "transactions_canonical".to_string(),
+        "address_relationships_canonical".to_string(),
+        "semantic_aml_events".to_string(),
         "wallet_asset_balances".to_string(),
         "address_exposure".to_string(),
+        "exposure_runs".to_string(),
         "address_entity".to_string(),
-        "exchange_flows".to_string(),
+        "exchange_flows_canonical".to_string(),
+        "wallet_ml_model_deployments".to_string(),
     ];
     let evidence = build_evidence_rows(
         &snapshot_id,
@@ -228,6 +251,7 @@ async fn create_wallet_analysis_snapshot(
             "created_at_unix_ms": created_at_unix_ms,
             "data_cutoff_block": data_cutoff_block,
             "data_cutoff_unix_ms": data_cutoff_unix_ms,
+            "analysis_input_version": analysis_input_version,
             "source_tables": source_tables,
         },
         "risk": {
@@ -265,6 +289,7 @@ async fn create_wallet_analysis_snapshot(
         entity_id: entity_id.clone(),
         analysis_version: ANALYSIS_VERSION.to_string(),
         analysis_status: investigation.ai_risk.status.clone(),
+        risk_available: risk_available as u8,
         risk_level: investigation.ai_risk.risk_level.clone(),
         risk_probability,
         risk_percent,
@@ -298,6 +323,7 @@ async fn create_wallet_analysis_snapshot(
         exposure_min_hop_distance: exposure_min_hop_distance(&investigation),
         data_cutoff_block,
         data_cutoff_unix_ms,
+        analysis_input_version: analysis_input_version.clone(),
         source_tables: source_tables.clone(),
         model_id: investigation.ai_risk.model_id.clone().unwrap_or_default(),
         model_version: investigation
@@ -330,6 +356,7 @@ async fn create_wallet_analysis_snapshot(
         entity_id: non_empty(entity_id),
         analysis_version: ANALYSIS_VERSION.to_string(),
         analysis_status: investigation.ai_risk.status,
+        risk_available,
         risk_level: investigation.ai_risk.risk_level,
         risk_probability,
         risk_percent,
@@ -338,6 +365,7 @@ async fn create_wallet_analysis_snapshot(
         fingerprint_label: investigation.fingerprint.fingerprint_label,
         data_cutoff_block,
         data_cutoff_unix_ms,
+        analysis_input_version,
         created_at_unix_ms,
         source_tables,
         warnings: investigation.data_quality.warnings,
@@ -390,11 +418,13 @@ async fn persist_analysis_subject(
         entity_id: entity_id.to_string(),
         latest_snapshot_id: snapshot.snapshot_id.clone(),
         latest_status: snapshot.analysis_status.clone(),
+        latest_risk_available: snapshot.risk_available,
         latest_risk_level: snapshot.risk_level.clone(),
         latest_risk_probability: snapshot.risk_probability,
         latest_confidence: snapshot.confidence,
         latest_data_cutoff_block: snapshot.data_cutoff_block,
         latest_data_cutoff_unix_ms: snapshot.data_cutoff_unix_ms,
+        latest_input_version: snapshot.analysis_input_version.clone(),
         created_at_unix_ms: now_unix_ms,
         updated_at_unix_ms: now_unix_ms,
     };
@@ -423,6 +453,7 @@ async fn load_latest_wallet_analysis_snapshot(
                 entity_id,
                 analysis_version,
                 analysis_status,
+                risk_available,
                 risk_level,
                 risk_probability,
                 risk_percent,
@@ -431,6 +462,7 @@ async fn load_latest_wallet_analysis_snapshot(
                 fingerprint_label,
                 data_cutoff_block,
                 data_cutoff_unix_ms,
+                analysis_input_version,
                 source_tables,
                 snapshot_json,
                 warnings,
@@ -468,6 +500,7 @@ async fn load_latest_wallet_analysis_snapshot(
         entity_id: non_empty(row.entity_id),
         analysis_version: row.analysis_version,
         analysis_status: row.analysis_status,
+        risk_available: row.risk_available == 1,
         risk_level: row.risk_level,
         risk_probability: row.risk_probability,
         risk_percent: row.risk_percent,
@@ -476,6 +509,7 @@ async fn load_latest_wallet_analysis_snapshot(
         fingerprint_label: row.fingerprint_label,
         data_cutoff_block: row.data_cutoff_block,
         data_cutoff_unix_ms: row.data_cutoff_unix_ms,
+        analysis_input_version: row.analysis_input_version,
         created_at_unix_ms: row.created_at_unix_ms,
         source_tables: row.source_tables,
         warnings: row.warnings,
@@ -667,31 +701,87 @@ fn collect_evidence_refs(investigation: &WalletInvestigation) -> Vec<String> {
     refs
 }
 
-fn data_cutoff(investigation: &WalletInvestigation) -> (u64, u64) {
-    let max_graph_block = investigation
-        .graph
-        .edges
-        .iter()
-        .map(|edge| edge.block_number)
-        .max()
-        .unwrap_or_default();
-    let max_graph_timestamp = investigation
-        .graph
-        .edges
-        .iter()
-        .map(|edge| edge.timestamp)
-        .max()
-        .unwrap_or_default();
-    let fingerprint_last_seen = investigation
-        .fingerprint
-        .behavior
-        .last_seen_timestamp
-        .unwrap_or_default();
+async fn load_indexed_cutoff(clickhouse: &Client) -> anyhow::Result<(u64, u64)> {
+    let row = clickhouse
+        .query(
+            r#"
+            SELECT
+                max(block_number) AS block_number,
+                argMax(block_timestamp, block_number) AS block_timestamp
+            FROM ingested_blocks FINAL
+            WHERE chain = 'tron'
+              AND ingestion_status = 'COMPLETE'
+            "#,
+        )
+        .fetch_one::<IndexedCutoffRow>()
+        .await
+        .context("failed to load TRON indexed data cutoff")?;
 
-    (
-        max_graph_block,
-        max_graph_timestamp.max(fingerprint_last_seen),
-    )
+    Ok((row.block_number, row.block_timestamp))
+}
+
+async fn load_analysis_input_version(clickhouse: &Client, address: &str) -> anyhow::Result<String> {
+    let row = clickhouse
+        .query(
+            r#"
+            SELECT concat(
+                toString((
+                    SELECT max(indexed_at_unix_ms)
+                    FROM ingested_blocks FINAL
+                    WHERE chain = 'tron' AND ingestion_status = 'COMPLETE'
+                )),
+                ':',
+                toString((
+                    SELECT max(toUnixTimestamp64Milli(created_at))
+                    FROM address_entity FINAL
+                    WHERE address = ?
+                )),
+                ':',
+                toString((
+                    SELECT max(run.completed_at_unix_ms)
+                    FROM exposure_runs FINAL AS run
+                    INNER JOIN address_exposure FINAL AS exposure
+                        ON exposure.source_address = run.source_address
+                       AND exposure.propagation_run_id = run.propagation_run_id
+                    WHERE exposure.exposed_address = ?
+                      AND run.status = 'COMPLETE'
+                )),
+                ':',
+                toString((
+                    SELECT max(toUnixTimestamp64Milli(seed.created_at))
+                    FROM address_exposure FINAL AS exposure
+                    INNER JOIN exposure_seeds FINAL AS seed
+                        ON seed.address = exposure.source_address
+                    WHERE exposure.exposed_address = ?
+                )),
+                ':',
+                toString((
+                    SELECT max(deployed_at_unix_ms)
+                    FROM wallet_ml_model_deployments FINAL
+                    WHERE environment = 'production'
+                      AND feature_schema_version = 'tron_wallet_behavior_features_v2'
+                )),
+                ':',
+                toString((
+                    SELECT max(toUnixTimestamp64Milli(metadata.updated_at))
+                    FROM wallet_asset_balances AS balance
+                    INNER JOIN token_metadata FINAL AS metadata
+                        ON balance.asset_type = 'trc20'
+                       AND balance.asset_id = metadata.token_address
+                    WHERE balance.address = ?
+                ))
+            ) AS analysis_input_version
+            "#,
+        )
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .bind(address)
+        .fetch_one::<AnalysisInputVersionRow>()
+        .await
+        .context("failed to load TRON analysis input version")?;
+
+    Ok(row.analysis_input_version)
 }
 
 fn exposure_min_hop_distance(investigation: &WalletInvestigation) -> u8 {

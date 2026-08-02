@@ -1,4 +1,5 @@
 use clickhouse::Row;
+use clickhouse::types::UInt256;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Row, Serialize)]
@@ -11,10 +12,6 @@ pub struct AddressRelationshipRow {
     pub tx_hash: String,
     pub block_number: u64,
     pub timestamp: u64,
-    pub amount: u128,
+    pub amount: UInt256,
     pub transfer_type: String,
-    pub event_type: String,
-    pub protocol: String,
-    pub risk_score: u8,
-    pub hop_count: u16,
 }
